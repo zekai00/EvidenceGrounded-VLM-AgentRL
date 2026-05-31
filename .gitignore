@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Large/local experiment artifacts
+outputs/
+checkpoints/
+runs/
+wandb/
+logs/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Local datasets and generated corpora should live under /root/datasets
+data/
+datasets/
+*.jsonl.tmp
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+

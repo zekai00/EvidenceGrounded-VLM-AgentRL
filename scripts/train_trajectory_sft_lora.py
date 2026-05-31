@@ -1,0 +1,666 @@
+#!/usr/bin/env python3
+"""LoRA SFT for EvidenceGrounded VLM tool-call trajectories.
+
+The dataset is a JSONL of chat rows:
+  image/text user prompt + assistant JSON action
+
+This script intentionally keeps the training loop small and explicit so each
+run can be audited from the saved summary, logs, and adapter directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+
+IMAGE_SIZE_CACHE: dict[str, tuple[int, int]] = {}
+
+ALLOWED_ACTIONS = {
+    "crop_image",
+    "retrieve_evidence",
+    "open_evidence",
+    "write_claim",
+    "abstain_claim",
+    "finish",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--train-jsonl",
+        default="/root/datasets/evidence_grounded_vlm_agentrl/agentbench_v0_3_1_low_text_vlm_full_sft_20260531_0248/sft/train.jsonl",
+    )
+    parser.add_argument(
+        "--val-jsonl",
+        default="/root/datasets/evidence_grounded_vlm_agentrl/agentbench_v0_3_1_low_text_vlm_full_sft_20260531_0248/sft/val.jsonl",
+    )
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--model", default="/root/models/Qwen2.5-VL-3B-Instruct")
+    parser.add_argument("--adapter", default=None, help="Optional existing LoRA adapter to continue training.")
+    parser.add_argument("--max-train-rows", type=int, default=0)
+    parser.add_argument("--max-val-rows", type=int, default=128)
+    parser.add_argument("--include-actions", default=None, help="Optional comma-separated gold action allowlist for training rows.")
+    parser.add_argument("--sample-strategy", choices=["first", "random", "balanced_action"], default="balanced_action")
+    parser.add_argument(
+        "--prompt-mode",
+        choices=["compact", "original"],
+        default="compact",
+        help="compact rebuilds a shorter state prompt from structured history/tool results; original uses dataset messages.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--epochs", type=float, default=1.0)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--torch-dtype",
+        default="bf16",
+        choices=["auto", "bf16", "bfloat16", "fp16", "float16", "fp32", "float32"],
+    )
+    parser.add_argument("--image-max-pixels", type=int, default=262144)
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=14336,
+        help="Maximum token length after chat templating. Prompt text is compacted before tokenization when needed.",
+    )
+    parser.add_argument(
+        "--max-text-chars",
+        type=int,
+        default=24000,
+        help="Maximum user text characters before tokenization; keeps head and tail.",
+    )
+    parser.add_argument("--head-text-chars", type=int, default=5000)
+    parser.add_argument("--max-history-actions", type=int, default=8)
+    parser.add_argument("--max-tool-results", type=int, default=6)
+    parser.add_argument("--max-evidence-per-result", type=int, default=3)
+    parser.add_argument("--snippet-chars", type=int, default=180)
+    parser.add_argument("--coordinate-info", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--log-every", type=int, default=5)
+    parser.add_argument("--eval-every", type=int, default=0, help="0 disables interim validation loss.")
+    parser.add_argument("--save-every", type=int, default=0, help="0 saves only final adapter.")
+    parser.add_argument("--system-prompt", default="")
+    return parser.parse_args()
+
+
+class JsonlDataset(Dataset):
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return self.rows[index]
+
+
+def main() -> int:
+    args = parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logs_path = output_dir / "train_log.jsonl"
+
+    train_rows_all = read_jsonl(Path(args.train_jsonl))
+    val_rows_all = read_jsonl(Path(args.val_jsonl)) if args.val_jsonl else []
+    train_rows_all = filter_rows_by_action(train_rows_all, args.include_actions)
+    train_rows = select_rows(train_rows_all, args.max_train_rows, args.sample_strategy, args.seed)
+    val_rows = select_rows(val_rows_all, args.max_val_rows, "balanced_action", args.seed + 17) if val_rows_all else []
+
+    processor, model = load_model_and_processor(args)
+    collator = VlmSftCollator(processor, args)
+
+    train_loader = DataLoader(
+        JsonlDataset(train_rows),
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=0,
+    )
+    val_loader = (
+        DataLoader(JsonlDataset(val_rows), batch_size=args.batch_size, shuffle=False, collate_fn=collator, num_workers=0)
+        if val_rows
+        else None
+    )
+
+    total_update_steps = max(1, math.ceil(len(train_loader) * args.epochs / args.gradient_accumulation_steps))
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=make_lr_schedule(total_update_steps, max(0, int(total_update_steps * args.warmup_ratio))),
+    )
+
+    run_config = {
+        "created_at": now(),
+        "model": args.model,
+        "adapter": args.adapter,
+        "train_jsonl": args.train_jsonl,
+        "val_jsonl": args.val_jsonl,
+        "train_rows_total": len(train_rows_all),
+        "val_rows_total": len(val_rows_all),
+        "train_rows_used": len(train_rows),
+        "val_rows_used": len(val_rows),
+        "train_action_distribution": dict(action_counter(train_rows)),
+        "val_action_distribution": dict(action_counter(val_rows)),
+        "args": vars(args),
+    }
+    (output_dir / "run_config.json").write_text(json.dumps(run_config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    global_step = 0
+    micro_step = 0
+    running_loss = 0.0
+    losses: list[float] = []
+    skipped_batches = 0
+
+    max_micro_steps = int(math.ceil(len(train_loader) * args.epochs))
+    while micro_step < max_micro_steps:
+        for batch in train_loader:
+            if micro_step >= max_micro_steps:
+                break
+            micro_step += 1
+            if batch is None:
+                skipped_batches += 1
+                continue
+            batch = move_to_device(batch, infer_input_device(model))
+            outputs = model(**batch)
+            loss = outputs.loss / args.gradient_accumulation_steps
+            loss.backward()
+            running_loss += float(loss.detach().cpu()) * args.gradient_accumulation_steps
+            losses.append(float(loss.detach().cpu()) * args.gradient_accumulation_steps)
+
+            if micro_step % args.gradient_accumulation_steps == 0 or micro_step == max_micro_steps:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+                if global_step % max(1, args.log_every) == 0 or global_step == 1:
+                    record = {
+                        "time": now(),
+                        "global_step": global_step,
+                        "micro_step": micro_step,
+                        "loss": running_loss / max(1, args.log_every),
+                        "lr": scheduler.get_last_lr()[0],
+                        "skipped_batches": skipped_batches,
+                    }
+                    append_jsonl(logs_path, record)
+                    print(json.dumps(record, ensure_ascii=False), flush=True)
+                    running_loss = 0.0
+
+                if args.eval_every and val_loader is not None and global_step % args.eval_every == 0:
+                    val_loss = evaluate_loss(model, val_loader, args)
+                    record = {"time": now(), "global_step": global_step, "val_loss": val_loss}
+                    append_jsonl(logs_path, record)
+                    print(json.dumps(record, ensure_ascii=False), flush=True)
+                    model.train()
+
+                if args.save_every and global_step % args.save_every == 0:
+                    save_adapter(model, processor, output_dir / f"checkpoint-{global_step}")
+
+    final_val_loss = evaluate_loss(model, val_loader, args) if val_loader is not None else None
+    adapter_dir = output_dir / "adapter"
+    save_adapter(model, processor, adapter_dir)
+    trainable, total = parameter_counts(model)
+    summary = {
+        "created_at": now(),
+        "output_dir": str(output_dir),
+        "adapter_dir": str(adapter_dir),
+        "model": args.model,
+        "base_or_initial_adapter": args.adapter,
+        "train_rows_used": len(train_rows),
+        "val_rows_used": len(val_rows),
+        "optimizer_steps": global_step,
+        "micro_steps": micro_step,
+        "mean_train_loss": sum(losses) / max(1, len(losses)),
+        "final_val_loss": final_val_loss,
+        "skipped_batches": skipped_batches,
+        "trainable_parameters": trainable,
+        "total_parameters": total,
+        "trainable_parameter_ratio": trainable / max(1, total),
+        "run_config": str(output_dir / "run_config.json"),
+        "train_log": str(logs_path),
+    }
+    (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return 0
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def select_rows(rows: list[dict[str, Any]], limit: int, strategy: str, seed: int) -> list[dict[str, Any]]:
+    if limit <= 0 or limit >= len(rows):
+        selected = list(rows)
+    elif strategy == "first":
+        selected = rows[:limit]
+    elif strategy == "random":
+        rng = random.Random(seed)
+        selected = list(rows)
+        rng.shuffle(selected)
+        selected = selected[:limit]
+    elif strategy == "balanced_action":
+        buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            buckets[str((row.get("action") or {}).get("action", "unknown"))].append(row)
+        rng = random.Random(seed)
+        for bucket in buckets.values():
+            rng.shuffle(bucket)
+        selected = []
+        action_names = sorted(buckets)
+        cursor = 0
+        while len(selected) < limit and any(buckets.values()):
+            name = action_names[cursor % len(action_names)]
+            cursor += 1
+            if buckets[name]:
+                selected.append(buckets[name].pop())
+    else:
+        raise ValueError(f"unknown sample strategy: {strategy}")
+    return selected
+
+
+def action_counter(rows: list[dict[str, Any]]) -> Counter[str]:
+    return Counter(str((row.get("action") or {}).get("action", "unknown")) for row in rows)
+
+
+def filter_rows_by_action(rows: list[dict[str, Any]], include_actions: str | None) -> list[dict[str, Any]]:
+    if not include_actions:
+        return rows
+    allowed = {item.strip() for item in include_actions.split(",") if item.strip()}
+    return [row for row in rows if str((row.get("action") or {}).get("action", "")) in allowed]
+
+
+class VlmSftCollator:
+    def __init__(self, processor: Any, args: argparse.Namespace) -> None:
+        self.processor = processor
+        self.args = args
+
+    def __call__(self, rows: list[dict[str, Any]]) -> dict[str, torch.Tensor] | None:
+        from qwen_vl_utils import process_vision_info
+
+        prepared = [self.prepare_row(row) for row in rows]
+        prepared = [item for item in prepared if item is not None]
+        if not prepared:
+            return None
+
+        prompt_messages = [item["prompt_messages"] for item in prepared]
+        full_messages = [item["full_messages"] for item in prepared]
+        prompt_texts = [
+            self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            for messages in prompt_messages
+        ]
+        full_texts = [
+            self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            for messages in full_messages
+        ]
+        image_inputs, video_inputs = process_vision_info(prompt_messages)
+        prompt_inputs = self.processor(
+            text=prompt_texts,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            truncation=True,
+            max_length=self.args.max_seq_length,
+            return_tensors="pt",
+        )
+        full_inputs = self.processor(
+            text=full_texts,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            truncation=True,
+            max_length=self.args.max_seq_length,
+            return_tensors="pt",
+        )
+        labels = full_inputs.input_ids.clone()
+        if "attention_mask" in full_inputs:
+            labels[full_inputs.attention_mask == 0] = -100
+        for i in range(labels.shape[0]):
+            prompt_len = int(prompt_inputs.input_ids[i].ne(self.processor.tokenizer.pad_token_id).sum().item())
+            labels[i, : min(prompt_len, labels.shape[1])] = -100
+        if int((labels != -100).sum().item()) == 0:
+            return None
+        full_inputs["labels"] = labels
+        return dict(full_inputs)
+
+    def prepare_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        if self.args.prompt_mode == "compact":
+            prompt_messages = build_compact_messages(row, self.args, include_assistant=False)
+            full_messages = build_compact_messages(row, self.args, include_assistant=True)
+        else:
+            messages = row.get("messages") or []
+            if len(messages) < 2 or messages[-1].get("role") != "assistant":
+                return None
+            prompt_messages = clone_messages(messages[:-1])
+            full_messages = clone_messages(messages)
+        if self.args.system_prompt:
+            prompt_messages = [{"role": "system", "content": self.args.system_prompt}] + prompt_messages
+            full_messages = [{"role": "system", "content": self.args.system_prompt}] + full_messages
+        prompt_messages = compact_messages(prompt_messages, self.args.max_text_chars, self.args.head_text_chars)
+        full_messages = compact_messages(full_messages, self.args.max_text_chars, self.args.head_text_chars)
+        return {"prompt_messages": prompt_messages, "full_messages": full_messages}
+
+
+def clone_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return json.loads(json.dumps(messages, ensure_ascii=False))
+
+
+def build_compact_messages(row: dict[str, Any], args: argparse.Namespace, *, include_assistant: bool) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = []
+    for image_path in row.get("images") or []:
+        content.append({"type": "image", "image": image_path})
+    content.append({"type": "text", "text": build_compact_prompt_text(row, args)})
+    messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
+    if include_assistant:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": json.dumps(row.get("action") or {}, ensure_ascii=False, separators=(",", ":")),
+            }
+        )
+    return messages
+
+
+def build_compact_prompt_text(row: dict[str, Any], args: argparse.Namespace) -> str:
+    meta = extract_meta_from_prompt(row.get("prompt_text", ""))
+    history = [simplify_action(item) for item in (row.get("history") or [])[-args.max_history_actions :]]
+    tool_results = [simplify_tool_result(item, args) for item in (row.get("tool_results") or [])[-args.max_tool_results :]]
+    draft_claims = row.get("draft_claims") or []
+    images = row.get("images") or []
+    lines = [
+        "你是 evidence-grounded figure understanding 的 VLM tool-call agent。",
+        "目标：根据 PDF 页面图像、局部裁剪图和可追溯证据，为红框/目标山水画图像写出有证据支撑的结构化 claim。",
+        f"task_id：{row.get('task_id')}；step：{row.get('step')}",
+        f"source_file：{meta.get('source_file', '')}；page：{meta.get('page', '')}",
+        f"输入图像：{len(images)} 张。第 1 张通常是 PDF 页面；第 2 张通常是已裁剪的目标图。",
+        "可用工具：",
+        '1. {"action":"crop_image","bbox":[x1,y1,x2,y2]}',
+        '2. {"action":"retrieve_evidence","query":"...","scope":"current_page|nearby_pages|same_document|corpus","anchor":{"source_file":"...","page":页码,"bbox":[x1,y1,x2,y2]},"top_k":整数}',
+        '3. {"action":"open_evidence","evidence_id":"ev_xxx"}',
+        '4. {"action":"write_claim","field":"caption_text|title|artist|dynasty|visual_elements|technique|composition","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}',
+        '5. {"action":"abstain_claim","field":"字段名","reason":"证据不足原因"}',
+        '6. {"action":"finish","status":"done"}',
+        "约束：只输出一个 JSON 对象；不要输出 markdown；不要编造作品名、画家、朝代、技法；证据不足就 abstain。",
+        "历史动作（保留最近若干步）：",
+        json.dumps(history, ensure_ascii=False, separators=(",", ":")),
+        "工具返回摘要（保留最近若干条，每条检索只保留前几个候选证据）：",
+        json.dumps(tool_results, ensure_ascii=False, separators=(",", ":")),
+        "当前 claims：",
+        json.dumps(draft_claims, ensure_ascii=False, separators=(",", ":")),
+        "请根据当前状态选择下一步工具调用。只输出一个 JSON 对象。",
+    ]
+    if args.coordinate_info:
+        image_info = [{"index": i + 1, "path": path, "size": image_size(path)} for i, path in enumerate(images)]
+        lines.insert(5, f"图像尺寸：{json.dumps(image_info, ensure_ascii=False, separators=(',', ':'))}")
+        lines.insert(6, "坐标规则：所有 bbox 都使用第 1 张 PDF 页面图像的像素坐标，原点在左上角，格式为 [x1,y1,x2,y2]；如果页面上有红框，crop_image 必须裁剪红框范围。")
+    return "\n".join(lines)
+
+
+def extract_meta_from_prompt(prompt_text: str) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    for key in ["source_file", "page"]:
+        marker = f"{key}："
+        if marker in prompt_text:
+            value = prompt_text.split(marker, 1)[1].split("；", 1)[0].split("\n", 1)[0].strip()
+            meta[key] = value
+    return meta
+
+
+def simplify_action(action: Any) -> Any:
+    if not isinstance(action, dict):
+        return action
+    keep = {k: action.get(k) for k in ["action", "bbox", "field", "evidence_id", "scope", "top_k", "value", "reason"] if k in action}
+    if "query" in action:
+        keep["query"] = truncate_text(str(action.get("query", "")), 120)
+    if "anchor" in action:
+        keep["anchor"] = action.get("anchor")
+    if "evidence_ids" in action:
+        keep["evidence_ids"] = action.get("evidence_ids")
+    return keep
+
+
+def simplify_tool_result(result: Any, args: argparse.Namespace) -> Any:
+    if not isinstance(result, dict):
+        return result
+    tool = result.get("tool")
+    if tool == "crop_image":
+        return {"tool": "crop_image", "bbox": result.get("bbox"), "crop_path": result.get("crop_path")}
+    if tool == "retrieve_evidence":
+        return {
+            "tool": "retrieve_evidence",
+            "scope": result.get("scope"),
+            "query": truncate_text(str(result.get("query", "")), 120),
+            "anchor": result.get("anchor"),
+            "results": [simplify_evidence(item, args) for item in (result.get("results") or [])[: args.max_evidence_per_result]],
+        }
+    if tool == "open_evidence":
+        simplified = {"tool": "open_evidence", "evidence_id": result.get("evidence_id")}
+        for key in ["source_file", "page_start", "page_end", "authority_level", "citation_level", "source_quality"]:
+            if key in result:
+                simplified[key] = result.get(key)
+        for key in ["display_snippet", "evidence_summary", "text", "raw_chunk_text"]:
+            if key in result and result.get(key):
+                simplified[key] = truncate_text(str(result.get(key)), args.snippet_chars)
+                break
+        return simplified
+    return {key: result.get(key) for key in list(result)[:8]}
+
+
+def simplify_evidence(item: Any, args: argparse.Namespace) -> Any:
+    if not isinstance(item, dict):
+        return item
+    snippet = item.get("evidence_summary") or item.get("display_snippet") or item.get("text") or ""
+    return {
+        "evidence_id": item.get("evidence_id"),
+        "source_file": item.get("source_file"),
+        "page_start": item.get("page_start"),
+        "page_end": item.get("page_end"),
+        "authority_level": item.get("authority_level"),
+        "citation_level": item.get("citation_level"),
+        "score": item.get("score"),
+        "snippet": truncate_text(str(snippet), args.snippet_chars),
+    }
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    text = " ".join(str(text).split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)] + "..."
+
+
+def image_size(path: str) -> dict[str, int | None]:
+    if path in IMAGE_SIZE_CACHE:
+        w, h = IMAGE_SIZE_CACHE[path]
+        return {"width": w, "height": h}
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            size = image.size
+        IMAGE_SIZE_CACHE[path] = size
+        return {"width": size[0], "height": size[1]}
+    except Exception:
+        return {"width": None, "height": None}
+
+
+def compact_messages(messages: list[dict[str, Any]], max_text_chars: int, head_text_chars: int) -> list[dict[str, Any]]:
+    if max_text_chars <= 0:
+        return messages
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if item.get("type") == "text" and isinstance(item.get("text"), str):
+                    item["text"] = compact_text(item["text"], max_text_chars, head_text_chars)
+        elif isinstance(content, str) and message.get("role") != "assistant":
+            message["content"] = compact_text(content, max_text_chars, head_text_chars)
+    return messages
+
+
+def compact_text(text: str, max_chars: int, head_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    head_chars = min(max(512, head_chars), max_chars - 512)
+    tail_chars = max_chars - head_chars
+    return (
+        text[:head_chars]
+        + "\n\n[中间过长的历史/证据返回已为训练截断，保留开头任务定义和结尾当前状态。]\n\n"
+        + text[-tail_chars:]
+    )
+
+
+def load_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any]:
+    from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+    from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+
+    dtype = parse_torch_dtype(args.torch_dtype)
+    processor_kwargs: dict[str, Any] = {"trust_remote_code": True}
+    if args.image_max_pixels:
+        processor_kwargs["max_pixels"] = args.image_max_pixels
+    processor = AutoProcessor.from_pretrained(args.model, **processor_kwargs)
+    if getattr(processor, "tokenizer", None) is not None:
+        processor.tokenizer.padding_side = "right"
+        if processor.tokenizer.pad_token is None:
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+    model_kwargs: dict[str, Any] = {"device_map": "auto", "trust_remote_code": True}
+    model_kwargs["torch_dtype"] = dtype if dtype != "auto" else "auto"
+    if args.load_in_4bit:
+        compute_dtype = torch.bfloat16 if dtype == "auto" else dtype
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+    model = AutoModelForImageTextToText.from_pretrained(args.model, **model_kwargs)
+    if args.load_in_4bit:
+        model = prepare_model_for_kbit_training(model)
+    if args.adapter:
+        model = PeftModel.from_pretrained(model, args.adapter, is_trainable=True)
+    else:
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules="all-linear",
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, peft_config)
+    model.config.use_cache = False
+    if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    return processor, model
+
+
+def parse_torch_dtype(name: str) -> Any:
+    normalized = str(name or "auto").lower()
+    if normalized == "auto":
+        return "auto"
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if normalized in {"fp16", "float16"}:
+        return torch.float16
+    if normalized in {"fp32", "float32"}:
+        return torch.float32
+    raise ValueError(f"unsupported torch dtype: {name}")
+
+
+def make_lr_schedule(total_steps: int, warmup_steps: int):
+    def schedule(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return max(1e-6, step / max(1, warmup_steps))
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, progress))))
+
+    return schedule
+
+
+def evaluate_loss(model: Any, val_loader: DataLoader | None, args: argparse.Namespace) -> float | None:
+    if val_loader is None:
+        return None
+    losses: list[float] = []
+    model.eval()
+    device = infer_input_device(model)
+    with torch.no_grad():
+        for batch in val_loader:
+            if batch is None:
+                continue
+            batch = move_to_device(batch, device)
+            outputs = model(**batch)
+            losses.append(float(outputs.loss.detach().cpu()))
+    return sum(losses) / max(1, len(losses))
+
+
+def move_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    return {key: value.to(device) if hasattr(value, "to") else value for key, value in batch.items()}
+
+
+def infer_input_device(model: Any) -> torch.device:
+    device = getattr(model, "device", None)
+    if device is not None and str(device) != "meta":
+        return torch.device(device)
+    for parameter in model.parameters():
+        if str(parameter.device) != "meta":
+            return parameter.device
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def save_adapter(model: Any, processor: Any, path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(path)
+    processor.save_pretrained(path)
+
+
+def parameter_counts(model: Any) -> tuple[int, int]:
+    total = sum(param.numel() for param in model.parameters())
+    trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    return trainable, total
+
+
+def now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

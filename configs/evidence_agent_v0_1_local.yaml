@@ -1,0 +1,45 @@
+project_name: EvidenceGrounded-VLM-AgentRL
+task_name: claim_level_evidence_seeking
+domain: chinese_landscape
+
+dataset_root: /root/datasets/evidence_grounded_vlm_agentrl
+
+source_stores:
+  legacy_milvus_documents:
+    source_root: /root/Workspace/ChineseLandscape/data/processed/documents
+    chunks: /root/Workspace/ChineseLandscape/data/processed/documents/chunks.jsonl
+    documents: /root/Workspace/ChineseLandscape/data/processed/documents/documents.jsonl
+    pages: /root/Workspace/ChineseLandscape/data/processed/documents/pages.jsonl
+    images: /root/Workspace/ChineseLandscape/data/processed/documents/images.jsonl
+    aliases: /root/Workspace/ChineseLandscape/data/processed/documents/source_aliases.json
+    source_type: legacy_milvus_pdf
+    authority_level: local_research_pdf
+    citation_level: chunk
+
+benchmark:
+  version: v0_1_local_evidence
+  max_tool_steps: 8
+  target_train_tasks: 400
+  target_val_tasks: 100
+  target_test_tasks: 100
+  manual_gold_min_val_test: 100
+
+tools:
+  - crop_image
+  - ocr_region
+  - search_evidence
+  - open_chunk
+  - write_claim
+  - abstain_claim
+  - write_card
+  - finish
+
+models:
+  local_baselines:
+    - /root/models/Qwen2.5-VL-3B-Instruct
+    - /root/models/Qwen2.5-VL-7B-Instruct
+  candidate_local:
+    - /root/models/qwen3-vl
+  api_teacher_optional:
+    - qwen3.7-max-2026-05-20
+
