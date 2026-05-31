@@ -27,8 +27,12 @@ data/
 datasets/
 *.jsonl.tmp
 
+# Private notes and internal reports kept outside the public repository
+docs/
+AGENTS.md
+MIGRATION_FROM_ChineseLandscape-AgentRL.md
+
 # OS/editor
 .DS_Store
 .idea/
 .vscode/
-

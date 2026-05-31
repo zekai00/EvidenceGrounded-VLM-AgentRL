@@ -1,115 +1,202 @@
 # EvidenceGrounded-VLM-AgentRL
 
-证据约束的多模态主动取证 VLM Agent RL 项目。
+<p align="center">
+  <a href="#中文"><kbd>中文</kbd></a>
+  <a href="#english"><kbd>English</kbd></a>
+</p>
 
-本项目的核心任务是：
+## 中文
+
+EvidenceGrounded-VLM-AgentRL 是一个面向多模态文档理解的 VLM 工具调用强化学习项目。
+
+项目目标是训练一个视觉语言模型，让它在阅读复杂 PDF 页面、图像区域和文本证据时，不是一次性给出答案，而是通过多步工具调用主动取证、引用证据、写入结构化结论，并在证据不足时拒答。
+
+核心任务定义：
 
 ```text
 Claim-Level Evidence-Seeking VLM Agent for multimodal document understanding
 ```
 
-给定 PDF 页面图像、局部裁剪图、OCR/PDF text、retrieval evidence store，模型需要在有限工具调用预算内主动取证，为结构化 claim 找到可追溯证据，并判断哪些字段应该回答、哪些字段应该 abstain。
+也就是：给定一个多模态文档任务，模型需要围绕每个 claim 主动寻找证据，并输出可追溯、可验证的结果。
 
-中国山水画资料是第一阶段验证场景。项目重点不是“山水画资料整理工具”，而是：
+### 为什么需要 Agent
 
-- 多模态文档理解；
-- VLM tool-call trajectory SFT；
-- verifier-guided on-policy RL；
-- claim-level evidence grounding；
-- hallucination / unsupported claim 控制；
-- 可复现 evidence store 与可评测 agent environment。
-
-## 当前状态
-
-当前已完成：
-
-- v0.3.1 evidence index：低文本页通过 VLM fallback 补充弱证据。
-- v0.3.3 highlighted SFT：通过 crop-to-page 模板匹配修正目标框，并在 page image 上绘制红框。
-- Qwen2.5-VL-3B LoRA trajectory SFT：得到第一版可用 tool-call adapter。
-
-当前保留的 SFT adapter：
+很多多模态文档任务不是单张图片问答。模型需要先定位相关区域，再检索上下文证据，再判断证据是否足够支持某个结构化字段。这个过程天然是多步的：
 
 ```text
-outputs/evidence_sft_qwen25vl3b_lora_compact_v2_highlight360_20260531_0510/adapter
+observe page -> inspect/crop region -> retrieve evidence -> open evidence -> write or abstain -> finish
 ```
 
-注意：`outputs/` 是本地实验产物，不提交 GitHub。需要复现实验时按报告中的命令重新生成，或单独发布到模型仓库。
+因此，本项目重点研究：
 
-## 关键结果
+- VLM tool-call trajectory learning；
+- evidence-grounded multimodal reasoning；
+- verifier-guided reinforcement learning；
+- unsupported claim 和 hallucination 控制；
+- 可执行、可复现的多模态 agent environment。
 
-v2 SFT adapter 在 v0.3.3 compact prompt 下的生成式 next-action 评测：
+### 当前进展
 
-| split | rows | valid_action_rate | action_type_acc | evidence_overlap_rate | scope_acc_on_retrieve |
-|---|---:|---:|---:|---:|---:|
-| val | 120 | 1.000 | 0.825 | 0.817 | 0.750 |
-| test | 120 | 0.992 | 0.858 | 0.858 | 0.900 |
+已完成第一版离线数据与 SFT 验证：
 
-当前主要未解决问题：
+- 构建了证据索引和多步工具调用轨迹数据；
+- 引入了低文本页面的 VLM 辅助转写流程；
+- 训练了 Qwen2.5-VL-3B LoRA trajectory SFT adapter；
+- 完成了生成式 next-action 评测；
+- 明确了下一阶段从 `crop_image(bbox)` 迁移到 `propose_regions -> crop_region(region_id)` 的可执行环境方案。
 
-- `crop_image` 的动作类型能学会，但 Qwen2.5-VL-3B 直接输出精确 page 像素 bbox 仍不可靠。
-- 后续应把 crop 改成红框检测/模板定位工具，或使用更强 VLM 做 grounding 对照。
+当前 SFT adapter 在 held-out next-action 评测中的核心结果：
 
-## 数据位置
+| split | valid action | action type | evidence overlap | retrieval scope |
+|---|---:|---:|---:|---:|
+| validation | 1.000 | 0.825 | 0.817 | 0.750 |
+| test | 0.992 | 0.858 | 0.858 | 0.900 |
 
-所有大数据、PDF、页面图、训练集和实验生成物放在：
+这些指标说明模型已经能较稳定地产生合法工具调用，并初步学会在证据检索和 claim 写入之间建立联系。
+
+### 方法概览
+
+当前训练链路分为四步：
+
+1. Evidence indexing：从多模态文档中构建可检索证据块。
+2. Trajectory SFT：把专家轨迹拆成“当前观察 + 历史 + 工具返回 -> 下一步 action”的监督样本。
+3. Executable environment：实现 `reset/step` 风格的工具调用环境，使模型输出可以被真实执行。
+4. On-policy RL：使用 verifier 对完整 trajectory 打分，对比 step-wise verifier-guided GRPO 和 trajectory-level clipped GRPO。
+
+### 主要研究问题
+
+- 小参数 VLM 是否能学会稳定的多步工具调用？
+- 候选区域选择是否比直接预测像素级 bbox 更适合文档 agent？
+- verifier-guided reward 能否提升证据命中率和拒答能力？
+- clipped ratio、reference KL、SFT replay 对 VLM agentic RL 的稳定性有什么影响？
+
+### 代码结构
 
 ```text
-/root/datasets/evidence_grounded_vlm_agentrl/
+configs/     Experiment configuration
+scripts/     Data construction, training, and evaluation scripts
+src/         Environment, tools, verifier, and agent modules
 ```
 
-当前主要数据版本：
+大型数据、模型权重、实验输出和内部报告不会提交到本仓库。
+
+### 下一步
+
+下一阶段将实现可执行工具调用环境：
 
 ```text
-/root/datasets/evidence_grounded_vlm_agentrl/evidence_index_v0_3_1_low_text_vlm_full_20260531_0140
-/root/datasets/evidence_grounded_vlm_agentrl/agentbench_v0_3_3_template_highlighted_sft_20260531_0504
+reset
+-> propose_regions
+-> crop_region
+-> retrieve_evidence
+-> open_evidence
+-> write_claim / abstain_claim
+-> finish
 ```
 
-当前可接入的 legacy evidence store 来自：
+然后在同一 verifier 下对比：
+
+- SFT only；
+- step-wise verifier-guided GRPO；
+- trajectory-level GRPO；
+- trajectory-level GRPO with clipped ratio；
+- trajectory-level GRPO with clipped ratio and reference KL。
+
+## English
+
+EvidenceGrounded-VLM-AgentRL is a VLM tool-call reinforcement learning project for multimodal document understanding.
+
+The goal is to train a vision-language model to solve evidence-seeking document tasks through multi-step tool calls. Instead of producing a one-shot answer, the model must inspect visual regions, retrieve evidence, cite supporting snippets, write structured claims, and abstain when evidence is insufficient.
+
+Core task:
 
 ```text
-/root/Workspace/ChineseLandscape/data/processed/documents
+Claim-Level Evidence-Seeking VLM Agent for multimodal document understanding
 ```
 
-其中 `chunks.jsonl` 含 4703 个 legacy Milvus 迁移证据块。
+In this task, the model actively gathers evidence for each claim and produces traceable, verifiable outputs.
 
-## 代码结构
+### Why Agentic Modeling
+
+Many multimodal document tasks are not single-image question answering problems. The model often needs to locate a relevant region, retrieve surrounding textual evidence, verify whether the evidence supports a structured field, and decide whether to answer or abstain.
+
+The natural workflow is multi-step:
 
 ```text
-configs/                  配置文件
-docs/01_规划与路线/        项目规划
-docs/02_指标与数据/        指标和数据说明
-docs/03_实验报告/          实验报告与样例
-scripts/                  数据构建、SFT 训练、评测脚本
-src/                      后续 environment / verifier / agent 代码
+observe page -> inspect/crop region -> retrieve evidence -> open evidence -> write or abstain -> finish
 ```
 
-## 主要脚本
+This project focuses on:
+
+- VLM tool-call trajectory learning;
+- evidence-grounded multimodal reasoning;
+- verifier-guided reinforcement learning;
+- unsupported-claim and hallucination control;
+- executable and reproducible multimodal agent environments.
+
+### Current Progress
+
+The first offline data and SFT stage has been completed:
+
+- built an evidence index and multi-step tool-call trajectories;
+- added VLM-assisted transcription for low-text pages;
+- trained a Qwen2.5-VL-3B LoRA trajectory SFT adapter;
+- evaluated generative next-action prediction;
+- planned the migration from `crop_image(bbox)` to `propose_regions -> crop_region(region_id)` for the executable environment.
+
+Current SFT adapter results on held-out next-action evaluation:
+
+| split | valid action | action type | evidence overlap | retrieval scope |
+|---|---:|---:|---:|---:|
+| validation | 1.000 | 0.825 | 0.817 | 0.750 |
+| test | 0.992 | 0.858 | 0.858 | 0.900 |
+
+These results show that the model can reliably emit valid tool calls and has learned an initial connection between evidence retrieval and claim writing.
+
+### Method Overview
+
+The current training pipeline has four stages:
+
+1. Evidence indexing: build retrievable evidence chunks from multimodal documents.
+2. Trajectory SFT: convert expert trajectories into supervised samples of “current observation + history + tool results -> next action”.
+3. Executable environment: implement a `reset/step` tool-call environment where model actions are actually executed.
+4. On-policy RL: use a verifier to score complete trajectories and compare step-wise verifier-guided GRPO with trajectory-level clipped GRPO.
+
+### Research Questions
+
+- Can a compact VLM learn stable multi-step tool use?
+- Is region-candidate selection more robust than direct pixel-level bbox prediction for document agents?
+- Can verifier-guided rewards improve evidence hit rate and abstention behavior?
+- How do clipped ratio, reference KL, and SFT replay affect the stability of VLM agentic RL?
+
+### Repository Layout
 
 ```text
-scripts/build_evidence_index_v0_3.py
-scripts/build_low_text_vlm_fallback.py
-scripts/merge_low_text_fallback_into_index_v0_3_1.py
-scripts/build_highlighted_sft_dataset.py
-scripts/train_trajectory_sft_lora.py
-scripts/eval_trajectory_sft_actions.py
+configs/     Experiment configuration
+scripts/     Data construction, training, and evaluation scripts
+src/         Environment, tools, verifier, and agent modules
 ```
 
-## 重要报告
+Large datasets, model weights, experiment outputs, and internal reports are intentionally excluded from this repository.
+
+### Next Step
+
+The next milestone is an executable tool-call environment:
 
 ```text
-docs/03_实验报告/EvidenceGrounded-SFT训练链路报告_20260531_0645.md
-docs/03_实验报告/v0.3.3完整SFT轨迹真实样例_20260531_0653.md
-docs/03_实验报告/LowTextPages-VLMFallback全量与v0.3.1SFT重建报告_20260531_0251.md
+reset
+-> propose_regions
+-> crop_region
+-> retrieve_evidence
+-> open_evidence
+-> write_claim / abstain_claim
+-> finish
 ```
 
-## 旧项目关系
+Then we will compare the following methods under the same verifier:
 
-旧目录：
-
-```text
-/root/Workspace/VLM/ChineseLandscape-AgentRL
-```
-
-保留为山水画 v0.1 seed 和历史实验目录。新目录承接算法叙事和后续开发。
-
-`EviTool-VL` 是另一个独立项目，主线是 Browser/GUI tool-call RL；本项目不应和 `EviTool-VL` 共用同一个 GitHub 仓库。
+- SFT only;
+- step-wise verifier-guided GRPO;
+- trajectory-level GRPO;
+- trajectory-level GRPO with clipped ratio;
+- trajectory-level GRPO with clipped ratio and reference KL.
