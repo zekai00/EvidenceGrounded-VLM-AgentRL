@@ -92,6 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-area-ratio", type=float, default=0.75)
     parser.add_argument("--min-width-ratio", type=float, default=0.07)
     parser.add_argument("--min-height-ratio", type=float, default=0.05)
+    parser.add_argument("--recursive-pdfs", action="store_true", default=True)
+    parser.add_argument("--no-recursive-pdfs", dest="recursive_pdfs", action="store_false")
+    parser.add_argument("--max-pdfs", type=int, default=0, help="Optional cap for quick expansion batches.")
+    parser.add_argument("--max-pages-per-pdf", type=int, default=0, help="Optional page cap per PDF for quick expansion batches.")
     parser.add_argument("--seed", type=int, default=20260530)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -225,10 +229,15 @@ def index_chunks_by_source(chunks: list[dict[str, Any]]) -> dict[str, list[dict[
 def collect_candidates(raw_pdfs_dir: Path, args: argparse.Namespace) -> list[Candidate]:
     candidates: list[Candidate] = []
     seen: set[tuple[str, int, tuple[int, int, int, int]]] = set()
-    for pdf_path in sorted(raw_pdfs_dir.glob("*.pdf")):
+    pdf_paths = raw_pdfs_dir.rglob("*.pdf") if args.recursive_pdfs else raw_pdfs_dir.glob("*.pdf")
+    for pdf_count, pdf_path in enumerate(sorted(pdf_paths), start=1):
+        if args.max_pdfs and pdf_count > args.max_pdfs:
+            break
         try:
             with fitz.open(pdf_path) as doc:
                 for page_index, page in enumerate(doc):
+                    if args.max_pages_per_pdf and page_index >= args.max_pages_per_pdf:
+                        break
                     rect = page.rect
                     for block in page.get_text("dict").get("blocks", []):
                         if block.get("type") != 1:

@@ -1,0 +1,20 @@
+- name: evidence_stepwise_agent
+  _target_: evidence_agent_env.verl_stepwise_agent_loop.EvidenceStepwiseAgentLoop
+  prompt_config:
+    max_history_actions: 8
+    max_tool_results: 6
+    max_evidence_per_result: 3
+    snippet_chars: 160
+    max_text_chars: 12000
+    head_text_chars: 3000
+    coordinate_info: true
+    tool_schema: chunked_claim
+    compact_claim_state: true
+    region_selection_hint: true
+    strict_claim_phase_hint: true
+    state_update_chars: 1200
+    max_action_tokens: 128
+    max_claim_action_tokens: 768
+  include_tool_images: true
+  max_state_regions: 8
+  auto_finish: true

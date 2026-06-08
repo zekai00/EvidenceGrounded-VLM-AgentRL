@@ -27,13 +27,24 @@ from torch.utils.data import DataLoader, Dataset
 IMAGE_SIZE_CACHE: dict[str, tuple[int, int]] = {}
 
 ALLOWED_ACTIONS = {
+    "inspect_page",
+    "propose_regions",
+    "select_evidence",
+    "crop_region",
+    "crop_target",
     "crop_image",
     "retrieve_evidence",
     "open_evidence",
     "write_claim",
     "abstain_claim",
+    "write_claims_chunk",
+    "write_claims_batch",
     "finish",
 }
+CLAIM_FIELD_SPEC = (
+    "caption_text|image_scope|depicted_work_title|displayed_region|object_type|artist|dynasty|"
+    "visual_elements|technique|composition|medium_dimensions|collection"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,6 +81,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora-target-modules",
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        help="Comma-separated LoRA target modules. Use all-linear only when the PEFT/quantization stack is known healthy.",
+    )
+    parser.add_argument(
+        "--disable-autoawq-dispatch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Disable PEFT AutoAWQ LoRA dispatcher. Useful when a broken awq package is installed but the base model is not AWQ.",
+    )
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--torch-dtype",
@@ -126,6 +148,7 @@ def main() -> int:
     train_rows_all = read_jsonl(Path(args.train_jsonl))
     val_rows_all = read_jsonl(Path(args.val_jsonl)) if args.val_jsonl else []
     train_rows_all = filter_rows_by_action(train_rows_all, args.include_actions)
+    val_rows_all = filter_rows_by_action(val_rows_all, args.include_actions)
     train_rows = select_rows(train_rows_all, args.max_train_rows, args.sample_strategy, args.seed)
     val_rows = select_rows(val_rows_all, args.max_val_rows, "balanced_action", args.seed + 17) if val_rows_all else []
 
@@ -403,33 +426,109 @@ def build_compact_prompt_text(row: dict[str, Any], args: argparse.Namespace) -> 
     tool_results = [simplify_tool_result(item, args) for item in (row.get("tool_results") or [])[-args.max_tool_results :]]
     draft_claims = row.get("draft_claims") or []
     images = row.get("images") or []
+    v0_7 = is_inspect_crop_row(row)
+    if v0_7:
+        target_line = "目标：先检查 PDF 页面布局，再裁剪目标山水画图像，之后检索证据并写出有证据支撑的结构化 claim。"
+        tool_lines = [
+            '1. {"action":"inspect_page","top_k":整数}',
+            '2. {"action":"crop_target","region_id":"r_xxx"} 或 {"action":"crop_target","bbox":[x1,y1,x2,y2]}',
+            '3. {"action":"retrieve_evidence","query":"...","scope":"current_page|nearby_pages|same_document|corpus","anchor":{"source_file":"...","page":页码,"bbox":[x1,y1,x2,y2]},"top_k":整数}',
+            '4. {"action":"open_evidence","evidence_id":"ev_xxx"}',
+            '5. {"action":"select_evidence","evidence_ids":["ev_xxx或local_caption_xxx"]}',
+            f'6. {{"action":"write_claims_chunk","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
+            f'7. {{"action":"write_claim","field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}',
+            '8. {"action":"abstain_claim","field":"字段名","reason":"证据不足原因"}',
+            f'9. {{"action":"write_claims_batch","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
+            '10. {"action":"finish","status":"done"}',
+        ]
+        coordinate_rule = (
+            "坐标规则：inspect_page 会返回 layout regions；region bbox 和 crop_target 的 bbox 都使用第 1 张 PDF 原始页面图像的像素坐标，"
+            "原点在左上角，格式为 [x1,y1,x2,y2]；先 inspect_page，再 crop_target。"
+        )
+    else:
+        target_line = "目标：根据 PDF 页面、候选区域、候选证据、局部裁剪图和可追溯证据，为目标山水画图像选择可信 evidence_id，并写出有证据支撑的结构化 claim。"
+        tool_lines = [
+            '1. {"action":"inspect_page"}',
+            '2. {"action":"propose_regions","top_k":整数}',
+            '3. {"action":"select_evidence","evidence_ids":["ev_xxx或local_caption_xxx"]}',
+            '4. {"action":"crop_region","region_id":"r_xxx"}',
+            '5. {"action":"crop_target","region_id":"r_xxx"} 或 {"action":"crop_target","bbox":[x1,y1,x2,y2]}',
+            '6. {"action":"crop_image","bbox":[x1,y1,x2,y2]}',
+            '7. {"action":"retrieve_evidence","query":"...","scope":"current_page|nearby_pages|same_document|corpus","anchor":{"source_file":"...","page":页码,"bbox":[x1,y1,x2,y2]},"top_k":整数}',
+            '8. {"action":"open_evidence","evidence_id":"ev_xxx"}',
+            f'9. {{"action":"write_claim","field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}',
+            '10. {"action":"abstain_claim","field":"字段名","reason":"证据不足原因"}',
+            f'11. {{"action":"write_claims_batch","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
+            '12. {"action":"finish","status":"done"}',
+        ]
+        coordinate_rule = (
+            "坐标规则：所有候选 region 和 bbox 都使用第 1 张 PDF 页面图像的像素坐标，原点在左上角，格式为 [x1,y1,x2,y2]；"
+            "无红框页面优先用 propose_regions 查看候选区域，下一步必须服从当前阶段允许的工具列表；"
+            "如果当前阶段只允许 crop_region，就不能提前 select_evidence。"
+        )
     lines = [
         "你是 evidence-grounded figure understanding 的 VLM tool-call agent。",
-        "目标：根据 PDF 页面图像、局部裁剪图和可追溯证据，为红框/目标山水画图像写出有证据支撑的结构化 claim。",
+        target_line,
         f"task_id：{row.get('task_id')}；step：{row.get('step')}",
         f"source_file：{meta.get('source_file', '')}；page：{meta.get('page', '')}",
         f"输入图像：{len(images)} 张。第 1 张通常是 PDF 页面；第 2 张通常是已裁剪的目标图。",
         "可用工具：",
-        '1. {"action":"crop_image","bbox":[x1,y1,x2,y2]}',
-        '2. {"action":"retrieve_evidence","query":"...","scope":"current_page|nearby_pages|same_document|corpus","anchor":{"source_file":"...","page":页码,"bbox":[x1,y1,x2,y2]},"top_k":整数}',
-        '3. {"action":"open_evidence","evidence_id":"ev_xxx"}',
-        '4. {"action":"write_claim","field":"caption_text|title|artist|dynasty|visual_elements|technique|composition","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}',
-        '5. {"action":"abstain_claim","field":"字段名","reason":"证据不足原因"}',
-        '6. {"action":"finish","status":"done"}',
+        *tool_lines,
         "约束：只输出一个 JSON 对象；不要输出 markdown；不要编造作品名、画家、朝代、技法；证据不足就 abstain。",
+        "Claim 写入约束：write_claims_chunk 每次最多写入或 abstain 1 个 remaining_fields 中的字段；remaining_fields 非空时禁止 finish。",
         "历史动作（保留最近若干步）：",
         json.dumps(history, ensure_ascii=False, separators=(",", ":")),
         "工具返回摘要（保留最近若干条，每条检索只保留前几个候选证据）：",
         json.dumps(tool_results, ensure_ascii=False, separators=(",", ":")),
+        "已选择 evidence_ids：",
+        json.dumps(row.get("selected_evidence_ids") or [], ensure_ascii=False, separators=(",", ":")),
+        "当前阶段允许的工具：",
+        json.dumps(row.get("available_actions") or [], ensure_ascii=False, separators=(",", ":")),
+        "阶段约束：如果当前阶段允许的工具列表非空，输出 JSON 的 action 必须严格从该列表中选择；总工具表中的其他工具此时禁止使用。",
+        f"阶段提示：{row.get('phase_hint') or ''}",
+        "当前 claim_state（优先依据 target_fields / remaining_fields 判断需要继续写哪些字段，以及何时可以 finish）：",
+        json.dumps(simplify_claim_state(row.get("claim_state") or {}), ensure_ascii=False, separators=(",", ":")),
         "当前 claims：",
         json.dumps(draft_claims, ensure_ascii=False, separators=(",", ":")),
         "请根据当前状态选择下一步工具调用。只输出一个 JSON 对象。",
     ]
+    if is_crop_only_region_selection_row(row):
+        crop_action = "crop_target" if v0_7 else "crop_region"
+        region_source = "inspect_page 返回的 layout regions" if v0_7 else "propose_regions 返回的候选区域"
+        lines.insert(
+            5,
+            f"阶段提示：当前已经看到 {region_source}；当前阶段只允许 {crop_action}，"
+            "禁止 select_evidence、open_evidence、retrieve_evidence 或 finish。"
+            f"下一步必须输出 {{\"action\":\"{crop_action}\",\"region_id\":\"r0\"}} 这种 JSON，region_id 必须来自候选区域列表。",
+        )
+        lines.insert(6, "当前阶段允许的工具（必须只从这里选择 action）：")
+        lines.insert(7, json.dumps([crop_action], ensure_ascii=False, separators=(",", ":")))
     if args.coordinate_info:
         image_info = [{"index": i + 1, "path": path, "size": image_size(path)} for i, path in enumerate(images)]
         lines.insert(5, f"图像尺寸：{json.dumps(image_info, ensure_ascii=False, separators=(',', ':'))}")
-        lines.insert(6, "坐标规则：所有 bbox 都使用第 1 张 PDF 页面图像的像素坐标，原点在左上角，格式为 [x1,y1,x2,y2]；如果页面上有红框，crop_image 必须裁剪红框范围。")
+        lines.insert(6, coordinate_rule)
     return "\n".join(lines)
+
+
+def is_inspect_crop_row(row: dict[str, Any]) -> bool:
+    version = str(row.get("tool_schema_version") or "")
+    if "v0.7" in version or "inspect_crop" in version:
+        return True
+    actions = [row.get("action") if isinstance(row.get("action"), dict) else {}]
+    actions.extend(item for item in row.get("history") or [] if isinstance(item, dict))
+    return any(str(item.get("action")) in {"inspect_page", "crop_target"} for item in actions)
+
+
+def is_crop_only_region_selection_row(row: dict[str, Any]) -> bool:
+    action = row.get("action") if isinstance(row.get("action"), dict) else {}
+    if action.get("action") not in {"crop_region", "crop_target"}:
+        return False
+    history_actions = [item.get("action") for item in row.get("history") or [] if isinstance(item, dict)]
+    tool_names = [item.get("tool") for item in row.get("tool_results") or [] if isinstance(item, dict)]
+    has_regions = any(name in history_actions or name in tool_names for name in ["inspect_page", "propose_regions"])
+    return has_regions and not any(
+        name in tool_names for name in ["crop_region", "crop_target", "crop_image"]
+    )
 
 
 def extract_meta_from_prompt(prompt_text: str) -> dict[str, Any]:
@@ -445,13 +544,21 @@ def extract_meta_from_prompt(prompt_text: str) -> dict[str, Any]:
 def simplify_action(action: Any) -> Any:
     if not isinstance(action, dict):
         return action
-    keep = {k: action.get(k) for k in ["action", "bbox", "field", "evidence_id", "scope", "top_k", "value", "reason"] if k in action}
+    keep = {
+        k: action.get(k)
+        for k in ["action", "bbox", "region_id", "field", "evidence_id", "scope", "top_k", "value", "reason", "status"]
+        if k in action
+    }
     if "query" in action:
         keep["query"] = truncate_text(str(action.get("query", "")), 120)
     if "anchor" in action:
         keep["anchor"] = action.get("anchor")
     if "evidence_ids" in action:
         keep["evidence_ids"] = action.get("evidence_ids")
+    if "claims" in action:
+        keep["claims"] = action.get("claims")
+    if "abstains" in action:
+        keep["abstains"] = action.get("abstains")
     return keep
 
 
@@ -459,8 +566,29 @@ def simplify_tool_result(result: Any, args: argparse.Namespace) -> Any:
     if not isinstance(result, dict):
         return result
     tool = result.get("tool")
-    if tool == "crop_image":
-        return {"tool": "crop_image", "bbox": result.get("bbox"), "crop_path": result.get("crop_path")}
+    if tool in {"crop_image", "crop_region", "crop_target"}:
+        keep = {"tool": tool, "bbox": result.get("bbox"), "crop_path": result.get("crop_path")}
+        if "region_id" in result:
+            keep["region_id"] = result.get("region_id")
+        return keep
+    if tool in {"propose_regions", "inspect_page"} and result.get("regions"):
+        return {
+            "tool": tool,
+            "regions": [
+                {
+                    "region_id": item.get("region_id"),
+                    "bbox": item.get("bbox"),
+                    "type": item.get("type"),
+                    "source": item.get("source"),
+                    "score": item.get("score"),
+                    "nearby_text": truncate_text(str(item.get("nearby_text", "")), 120) if item.get("nearby_text") else None,
+                    "caption_evidence_id": item.get("caption_evidence_id"),
+                    "caption_hint": truncate_text(str(item.get("caption_hint", "")), 120) if item.get("caption_hint") else None,
+                    "hint": truncate_text(str(item.get("hint", "")), 120) if item.get("hint") else None,
+                }
+                for item in (result.get("regions") or [])[: args.max_evidence_per_result * 2]
+            ],
+        }
     if tool == "retrieve_evidence":
         return {
             "tool": "retrieve_evidence",
@@ -468,6 +596,16 @@ def simplify_tool_result(result: Any, args: argparse.Namespace) -> Any:
             "query": truncate_text(str(result.get("query", "")), 120),
             "anchor": result.get("anchor"),
             "results": [simplify_evidence(item, args) for item in (result.get("results") or [])[: args.max_evidence_per_result]],
+        }
+    if tool == "select_evidence":
+        return {
+            "tool": "select_evidence",
+            "selected_evidence_ids": result.get("selected_evidence_ids") or [],
+            "selected_evidence": [
+                simplify_evidence(item, args)
+                for item in (result.get("selected_evidence") or [])[: args.max_evidence_per_result]
+            ],
+            "rejected_evidence_ids": result.get("rejected_evidence_ids") or [],
         }
     if tool == "open_evidence":
         simplified = {"tool": "open_evidence", "evidence_id": result.get("evidence_id")}
@@ -480,6 +618,21 @@ def simplify_tool_result(result: Any, args: argparse.Namespace) -> Any:
                 break
         return simplified
     return {key: result.get(key) for key in list(result)[:8]}
+
+
+def simplify_claim_state(claim_state: Any) -> dict[str, Any]:
+    if not isinstance(claim_state, dict):
+        return {}
+    keep_keys = [
+        "target_fields",
+        "written_fields",
+        "abstained_fields",
+        "remaining_fields",
+        "claim_count",
+        "abstain_count",
+        "evidence_ids",
+    ]
+    return {key: claim_state.get(key) for key in keep_keys if key in claim_state}
 
 
 def simplify_evidence(item: Any, args: argparse.Namespace) -> Any:
@@ -550,6 +703,9 @@ def load_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any]:
     from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
+    if args.disable_autoawq_dispatch:
+        disable_autoawq_dispatch()
+
     dtype = parse_torch_dtype(args.torch_dtype)
     processor_kwargs: dict[str, Any] = {"trust_remote_code": True}
     if args.image_max_pixels:
@@ -580,7 +736,7 @@ def load_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any]:
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            target_modules="all-linear",
+            target_modules=parse_lora_target_modules(args.lora_target_modules),
             bias="none",
             task_type="CAUSAL_LM",
         )
@@ -591,6 +747,25 @@ def load_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any]:
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
     return processor, model
+
+
+def parse_lora_target_modules(value: str) -> str | list[str]:
+    value = str(value or "").strip()
+    if not value or value == "all-linear":
+        return "all-linear"
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def disable_autoawq_dispatch() -> None:
+    try:
+        import peft.import_utils as peft_import_utils
+        import peft.tuners.lora.awq as peft_lora_awq
+
+        peft_import_utils.is_auto_awq_available.cache_clear()
+        peft_import_utils.is_auto_awq_available = lambda: False
+        peft_lora_awq.is_auto_awq_available = lambda: False
+    except Exception:
+        return
 
 
 def parse_torch_dtype(name: str) -> Any:

@@ -16,25 +16,61 @@ from typing import Any
 import torch
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 IMAGE_SIZE_CACHE: dict[str, tuple[int, int]] = {}
 
 ALLOWED_ACTIONS = {
+    "inspect_page",
+    "propose_regions",
+    "select_evidence",
+    "crop_region",
+    "crop_target",
     "crop_image",
     "retrieve_evidence",
     "open_evidence",
     "write_claim",
     "abstain_claim",
+    "write_claims_chunk",
+    "write_claims_batch",
     "finish",
 }
+CLAIM_FIELD_SPEC = (
+    "caption_text|image_scope|depicted_work_title|displayed_region|object_type|artist|dynasty|"
+    "visual_elements|technique|composition|medium_dimensions|collection"
+)
 
 REQUIRED_KEYS: dict[str, set[str]] = {
+    "inspect_page": set(),
+    "propose_regions": {"top_k"},
+    "select_evidence": {"evidence_ids"},
+    "crop_region": {"region_id"},
+    "crop_target": set(),
     "crop_image": {"bbox"},
     "retrieve_evidence": {"query", "scope", "anchor", "top_k"},
     "open_evidence": {"evidence_id"},
     "write_claim": {"field", "value", "evidence_ids", "visual_bbox", "confidence"},
     "abstain_claim": {"field", "reason"},
+    "write_claims_chunk": {"claims"},
+    "write_claims_batch": {"claims"},
     "finish": set(),
 }
+
+BATCH_METRIC_KEYS = [
+    "batch_schema_valid",
+    "batch_claim_field_precision",
+    "batch_claim_field_recall",
+    "batch_claim_field_f1",
+    "batch_all_field_precision",
+    "batch_all_field_recall",
+    "batch_all_field_f1",
+    "batch_evidence_precision",
+    "batch_evidence_recall",
+    "batch_evidence_f1",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="/root/models/Qwen2.5-VL-3B-Instruct")
     parser.add_argument("--adapter", default=None)
     parser.add_argument("--max-rows", type=int, default=128)
+    parser.add_argument("--include-actions", default=None, help="Optional comma-separated gold action allowlist for eval rows.")
     parser.add_argument("--sample-strategy", choices=["first", "random", "balanced_action"], default="balanced_action")
     parser.add_argument(
         "--prompt-mode",
@@ -56,6 +93,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--disable-autoawq-dispatch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Disable PEFT AutoAWQ LoRA dispatcher. Useful when a broken awq package is installed but the base model is not AWQ.",
+    )
     parser.add_argument(
         "--torch-dtype",
         default="bf16",
@@ -69,6 +112,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-evidence-per-result", type=int, default=3)
     parser.add_argument("--snippet-chars", type=int, default=180)
     parser.add_argument("--coordinate-info", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--region-selection-hint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When prompt-mode=compact, include the non-answer-leaking crop_region phase hint.",
+    )
+    parser.add_argument(
+        "--strict-claim-phase-hint",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When prompt-mode=compact, include the stricter claim-writing phase hint.",
+    )
     parser.add_argument("--max-seq-length", type=int, default=14336)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -86,6 +141,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rows_all = read_jsonl(Path(args.eval_jsonl))
+    rows_all = filter_rows_by_action(rows_all, args.include_actions)
     rows = select_rows(rows_all, args.max_rows, args.sample_strategy, args.seed)
 
     processor, model = load_model_and_processor(args)
@@ -134,6 +190,7 @@ class Metrics:
         self.n = 0
         self.counts: Counter[str] = Counter()
         self.denoms: Counter[str] = Counter()
+        self.batch_counts: Counter[str] = Counter()
         self.by_gold_action: dict[str, Counter[str]] = defaultdict(Counter)
         self.bbox_ious: list[float] = []
 
@@ -160,10 +217,29 @@ class Metrics:
             self.denoms["retrieve_evidence"] += 1
         if gold_type == "crop_image":
             self.denoms["crop_image"] += 1
-        if gold_type in {"write_claim", "abstain_claim", "open_evidence", "retrieve_evidence", "crop_image", "finish"}:
+        if gold_type in {
+            "write_claim",
+            "abstain_claim",
+            "write_claims_chunk",
+            "write_claims_batch",
+            "open_evidence",
+            "retrieve_evidence",
+            "select_evidence",
+            "crop_image",
+            "crop_region",
+            "propose_regions",
+            "inspect_page",
+            "finish",
+        }:
             self.denoms["field_comparable"] += 1
         if result["bbox_iou"] >= 0:
             self.bbox_ious.append(float(result["bbox_iou"]))
+        if gold_type in {"write_claims_batch", "write_claims_chunk"}:
+            self.denoms["write_claims_batch"] += 1
+            for key in BATCH_METRIC_KEYS:
+                value = float(result.get(key, 0.0))
+                self.batch_counts[key] += value
+                self.by_gold_action[gold_type][key] += value
         for key in [
             "valid_json",
             "valid_action",
@@ -207,6 +283,10 @@ class Metrics:
             "scope_acc_on_retrieve": self.counts["scope_match"] / max(1, self.denoms["retrieve_evidence"]),
             "bbox_iou_ge_05_on_crop": self.counts["bbox_iou_ge_05"] / max(1, self.denoms["crop_image"]),
             "bbox_iou_mean": sum(self.bbox_ious) / max(1, len(self.bbox_ious)),
+            "write_claims_batch_metrics": {
+                key: self.batch_counts[key] / max(1, self.denoms["write_claims_batch"])
+                for key in BATCH_METRIC_KEYS
+            },
             "by_gold_action": by_action,
         }
 
@@ -219,6 +299,8 @@ def score_prediction(gold: dict[str, Any], pred: dict[str, Any] | None) -> dict[
     action_type_match = valid_action and pred_type == gold_type
     required = REQUIRED_KEYS.get(pred_type, set())
     required_keys_match = valid_action and required.issubset(set(pred or {}))
+    if valid_action and pred_type == "crop_target":
+        required_keys_match = bool(pred.get("region_id")) or isinstance(pred.get("bbox"), list)
     exact_match = canonical_action(gold) == canonical_action(pred) if isinstance(pred, dict) else False
     field_match = action_type_match and compare_field(gold, pred)
     evidence_overlap = action_type_match and compare_evidence_ids(gold, pred)
@@ -228,7 +310,7 @@ def score_prediction(gold: dict[str, Any], pred: dict[str, Any] | None) -> dict[
     bbox_iou = -1.0
     if action_type_match and gold_type == "crop_image":
         bbox_iou = iou(gold.get("bbox"), pred.get("bbox"))
-    return {
+    result = {
         "valid_json": bool(valid_json),
         "valid_action": bool(valid_action),
         "action_type_match": bool(action_type_match),
@@ -239,6 +321,39 @@ def score_prediction(gold: dict[str, Any], pred: dict[str, Any] | None) -> dict[
         "scope_match": bool(scope_match),
         "bbox_iou": bbox_iou,
     }
+    if gold_type in {"write_claims_batch", "write_claims_chunk"}:
+        result.update(score_write_claims_batch(gold, pred))
+    return result
+
+
+def score_write_claims_batch(gold: dict[str, Any], pred: dict[str, Any] | None) -> dict[str, float]:
+    if (
+        not isinstance(pred, dict)
+        or pred.get("action") != gold.get("action")
+        or pred.get("action") not in {"write_claims_batch", "write_claims_chunk"}
+    ):
+        return {key: 0.0 for key in BATCH_METRIC_KEYS}
+    gold_claim_fields = claim_fields(gold)
+    pred_claim_fields = claim_fields(pred)
+    gold_all_fields = batch_fields(gold)
+    pred_all_fields = batch_fields(pred)
+    gold_evidence = batch_evidence_ids(gold)
+    pred_evidence = batch_evidence_ids(pred)
+    claim_field_prf = precision_recall_f1(pred_claim_fields, gold_claim_fields)
+    all_field_prf = precision_recall_f1(pred_all_fields, gold_all_fields)
+    evidence_prf = precision_recall_f1(pred_evidence, gold_evidence)
+    return {
+        "batch_schema_valid": float(is_valid_write_claims_batch_schema(pred)),
+        "batch_claim_field_precision": claim_field_prf["precision"],
+        "batch_claim_field_recall": claim_field_prf["recall"],
+        "batch_claim_field_f1": claim_field_prf["f1"],
+        "batch_all_field_precision": all_field_prf["precision"],
+        "batch_all_field_recall": all_field_prf["recall"],
+        "batch_all_field_f1": all_field_prf["f1"],
+        "batch_evidence_precision": evidence_prf["precision"],
+        "batch_evidence_recall": evidence_prf["recall"],
+        "batch_evidence_f1": evidence_prf["f1"],
+    }
 
 
 def compare_field(gold: dict[str, Any], pred: dict[str, Any] | None) -> bool:
@@ -247,13 +362,27 @@ def compare_field(gold: dict[str, Any], pred: dict[str, Any] | None) -> bool:
     action = gold.get("action")
     if action in {"write_claim", "abstain_claim"}:
         return str(gold.get("field", "")) == str(pred.get("field", ""))
+    if action in {"write_claims_batch", "write_claims_chunk"}:
+        gold_fields = batch_fields(gold)
+        pred_fields = batch_fields(pred)
+        return bool(gold_fields) and gold_fields == pred_fields
     if action == "open_evidence":
         return str(gold.get("evidence_id", "")) == str(pred.get("evidence_id", ""))
+    if action == "select_evidence":
+        gold_ids = set(map(str, gold.get("evidence_ids") or []))
+        pred_ids = set(map(str, pred.get("evidence_ids") or []))
+        return bool(gold_ids) and gold_ids == pred_ids
     if action == "retrieve_evidence":
         return bool(str(pred.get("query", "")).strip()) and str(gold.get("scope", "")) == str(pred.get("scope", ""))
     if action == "finish":
         return True
-    if action == "crop_image":
+    if action == "inspect_page":
+        return True
+    if action == "propose_regions":
+        return int(gold.get("top_k", 0)) == int(pred.get("top_k", -1))
+    if action in {"crop_region", "crop_target"} and gold.get("region_id"):
+        return str(gold.get("region_id", "")) == str(pred.get("region_id", ""))
+    if action in {"crop_image", "crop_target"} and gold.get("bbox"):
         return iou(gold.get("bbox"), pred.get("bbox")) >= 0.5
     return False
 
@@ -263,9 +392,100 @@ def compare_evidence_ids(gold: dict[str, Any], pred: dict[str, Any] | None) -> b
         return False
     gold_ids = set(map(str, gold.get("evidence_ids") or []))
     pred_ids = set(map(str, pred.get("evidence_ids") or []))
+    if gold.get("action") in {"write_claims_batch", "write_claims_chunk"}:
+        gold_ids = batch_evidence_ids(gold)
+        pred_ids = batch_evidence_ids(pred)
     if not gold_ids and not pred_ids:
         return True
     return bool(gold_ids & pred_ids)
+
+
+def batch_fields(action: dict[str, Any] | None) -> set[str]:
+    if not isinstance(action, dict):
+        return set()
+    fields = {str(item.get("field")) for item in action.get("claims") or [] if isinstance(item, dict) and item.get("field")}
+    fields.update(str(item.get("field")) for item in action.get("abstains") or [] if isinstance(item, dict) and item.get("field"))
+    return fields
+
+
+def claim_fields(action: dict[str, Any] | None) -> set[str]:
+    if not isinstance(action, dict):
+        return set()
+    return {str(item.get("field")) for item in action.get("claims") or [] if isinstance(item, dict) and item.get("field")}
+
+
+def batch_evidence_ids(action: dict[str, Any] | None) -> set[str]:
+    if not isinstance(action, dict):
+        return set()
+    ids: set[str] = set()
+    for item in action.get("claims") or []:
+        if isinstance(item, dict):
+            ids.update(str(eid) for eid in item.get("evidence_ids") or [])
+    return ids
+
+
+def precision_recall_f1(predicted: set[str], gold: set[str]) -> dict[str, float]:
+    if not predicted and not gold:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
+    if not predicted or not gold:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    overlap = len(predicted & gold)
+    precision = overlap / len(predicted)
+    recall = overlap / len(gold)
+    denom = precision + recall
+    f1 = 2 * precision * recall / denom if denom else 0.0
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def is_valid_write_claims_batch_schema(action: dict[str, Any] | None) -> bool:
+    if not isinstance(action, dict) or action.get("action") not in {"write_claims_batch", "write_claims_chunk"}:
+        return False
+    claims = action.get("claims")
+    abstains = action.get("abstains", [])
+    if claims is None:
+        claims = []
+    if not isinstance(claims, list) or not isinstance(abstains, list):
+        return False
+    if not claims and not abstains:
+        return False
+    for item in claims:
+        if not is_valid_batch_claim(item):
+            return False
+    for item in abstains:
+        if not is_valid_batch_abstain(item):
+            return False
+    return True
+
+
+def is_valid_batch_claim(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if not str(item.get("field", "")).strip():
+        return False
+    if "value" not in item:
+        return False
+    evidence_ids = item.get("evidence_ids")
+    if not isinstance(evidence_ids, list):
+        return False
+    if "visual_bbox" not in item:
+        return False
+    bbox = item.get("visual_bbox")
+    if bbox is not None and (not isinstance(bbox, list) or len(bbox) != 4):
+        return False
+    confidence = item.get("confidence")
+    if not isinstance(confidence, (int, float)) or not 0 <= float(confidence) <= 1:
+        return False
+    return True
+
+
+def is_valid_batch_abstain(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if not str(item.get("field", "")).strip():
+        return False
+    if not str(item.get("reason", "")).strip():
+        return False
+    return True
 
 
 def canonical_action(action: dict[str, Any] | None) -> Any:
@@ -385,6 +605,13 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def filter_rows_by_action(rows: list[dict[str, Any]], include_actions: str | None) -> list[dict[str, Any]]:
+    if not include_actions:
+        return rows
+    allowed = {item.strip() for item in include_actions.split(",") if item.strip()}
+    return [row for row in rows if str((row.get("action") or {}).get("action", "")) in allowed]
+
+
 def select_rows(rows: list[dict[str, Any]], limit: int, strategy: str, seed: int) -> list[dict[str, Any]]:
     if limit <= 0 or limit >= len(rows):
         selected = list(rows)
@@ -419,6 +646,9 @@ def load_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any]:
     from peft import PeftModel
     from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
+    if args.disable_autoawq_dispatch:
+        disable_autoawq_dispatch()
+
     dtype = parse_torch_dtype(args.torch_dtype)
     processor_kwargs: dict[str, Any] = {"trust_remote_code": True}
     if args.image_max_pixels:
@@ -446,6 +676,18 @@ def load_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any]:
     return processor, model
 
 
+def disable_autoawq_dispatch() -> None:
+    try:
+        import peft.import_utils as peft_import_utils
+        import peft.tuners.lora.awq as peft_lora_awq
+
+        peft_import_utils.is_auto_awq_available.cache_clear()
+        peft_import_utils.is_auto_awq_available = lambda: False
+        peft_lora_awq.is_auto_awq_available = lambda: False
+    except Exception:
+        return
+
+
 def parse_torch_dtype(name: str) -> Any:
     normalized = str(name or "auto").lower()
     if normalized == "auto":
@@ -464,19 +706,72 @@ def clone_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def build_compact_messages(row: dict[str, Any], args: argparse.Namespace, *, include_assistant: bool) -> list[dict[str, Any]]:
-    content: list[dict[str, Any]] = []
-    for image_path in row.get("images") or []:
-        content.append({"type": "image", "image": image_path})
-    content.append({"type": "text", "text": build_compact_prompt_text(row, args)})
-    messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
-    if include_assistant:
-        messages.append(
-            {
-                "role": "assistant",
-                "content": json.dumps(row.get("action") or {}, ensure_ascii=False, separators=(",", ":")),
-            }
-        )
-    return messages
+    from evidence_agent_env.context_manager import ContextBudget, ContextManager
+
+    budget = ContextBudget(
+        max_history_actions=args.max_history_actions,
+        max_tool_results=args.max_tool_results,
+        max_evidence_per_result=args.max_evidence_per_result,
+        snippet_chars=args.snippet_chars,
+        max_text_chars=args.max_text_chars,
+        head_text_chars=args.head_text_chars,
+    )
+    manager = ContextManager(
+        budget=budget,
+        tool_schema=infer_tool_schema(row),
+        region_selection_hint=args.region_selection_hint,
+        strict_claim_phase_hint=args.strict_claim_phase_hint,
+    )
+    return manager.build_messages(
+        row_to_observation(row),
+        include_assistant_action=(row.get("action") or {}) if include_assistant else None,
+    )
+
+
+def row_to_observation(row: dict[str, Any]) -> dict[str, Any]:
+    meta = extract_meta_from_prompt(row.get("prompt_text", ""))
+    images: list[dict[str, Any]] = []
+    for index, image_path in enumerate(row.get("images") or []):
+        role = "page_image" if index == 0 else "crop_image"
+        images.append({"role": role, "path": str(image_path)})
+    return {
+        "task_id": row.get("task_id"),
+        "goal": row.get("goal"),
+        "step": row.get("step"),
+        "source_file": row.get("source_file") or meta.get("source_file", ""),
+        "page": row.get("page") if row.get("page") is not None else parse_page(meta.get("page")),
+        "images": images,
+        "history": row.get("history") or [],
+        "tool_results": row.get("tool_results") or [],
+        "draft_claims": row.get("draft_claims") or [],
+        "claim_state": row.get("claim_state") or {},
+        "selected_evidence_ids": row.get("selected_evidence_ids") or [],
+    }
+
+
+def parse_page(value: Any) -> int | str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def infer_tool_schema(row: dict[str, Any]) -> str:
+    version = str(row.get("tool_schema_version") or "")
+    actions = [str((row.get("action") or {}).get("action", ""))]
+    actions.extend(str(item.get("action", "")) for item in row.get("history") or [] if isinstance(item, dict))
+    if "inspect_crop" in version or "crop_target" in actions:
+        return "inspect_crop"
+    if "chunked_claim" in version or "write_claims_chunk" in actions:
+        return "chunked_claim"
+    if any(action in {"inspect_page", "propose_regions", "crop_region", "crop_target", "select_evidence"} for action in actions):
+        return "evidence_select"
+    return "highlighted_direct"
 
 
 def build_compact_prompt_text(row: dict[str, Any], args: argparse.Namespace) -> str:
@@ -484,25 +779,53 @@ def build_compact_prompt_text(row: dict[str, Any], args: argparse.Namespace) -> 
     history = [simplify_action(item) for item in (row.get("history") or [])[-args.max_history_actions :]]
     tool_results = [simplify_tool_result(item, args) for item in (row.get("tool_results") or [])[-args.max_tool_results :]]
     draft_claims = row.get("draft_claims") or []
+    claim_state = row.get("claim_state") or {}
     images = row.get("images") or []
+    uses_chunked_claim = str((row.get("action") or {}).get("action", "")) == "write_claims_chunk" or any(
+        str(item.get("action", "")) == "write_claims_chunk" for item in history if isinstance(item, dict)
+    )
+    if uses_chunked_claim:
+        claim_tool_lines = [
+            f'10. {{"action":"write_claims_chunk","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
+            f'11. {{"action":"write_claims_batch","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
+            '12. {"action":"finish","status":"done"}',
+        ]
+    else:
+        claim_tool_lines = [
+            f'10. {{"action":"write_claims_batch","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
+            '11. {"action":"finish","status":"done"}',
+        ]
     lines = [
         "你是 evidence-grounded figure understanding 的 VLM tool-call agent。",
-        "目标：根据 PDF 页面图像、局部裁剪图和可追溯证据，为红框/目标山水画图像写出有证据支撑的结构化 claim。",
+        "目标：根据 PDF 页面、候选区域、候选证据、局部裁剪图和可追溯证据，为目标山水画图像选择可信 evidence_id，并写出有证据支撑的结构化 claim。",
         f"task_id：{row.get('task_id')}；step：{row.get('step')}",
         f"source_file：{meta.get('source_file', '')}；page：{meta.get('page', '')}",
         f"输入图像：{len(images)} 张。第 1 张通常是 PDF 页面；第 2 张通常是已裁剪的目标图。",
         "可用工具：",
-        '1. {"action":"crop_image","bbox":[x1,y1,x2,y2]}',
-        '2. {"action":"retrieve_evidence","query":"...","scope":"current_page|nearby_pages|same_document|corpus","anchor":{"source_file":"...","page":页码,"bbox":[x1,y1,x2,y2]},"top_k":整数}',
-        '3. {"action":"open_evidence","evidence_id":"ev_xxx"}',
-        '4. {"action":"write_claim","field":"caption_text|title|artist|dynasty|visual_elements|technique|composition","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}',
-        '5. {"action":"abstain_claim","field":"字段名","reason":"证据不足原因"}',
-        '6. {"action":"finish","status":"done"}',
+        '1. {"action":"inspect_page"}',
+        '2. {"action":"propose_regions","top_k":整数}',
+        '3. {"action":"select_evidence","evidence_ids":["ev_xxx或local_caption_xxx"]}',
+        '4. {"action":"crop_region","region_id":"r_xxx"}',
+        '5. {"action":"crop_target","region_id":"r_xxx"} 或 {"action":"crop_target","bbox":[x1,y1,x2,y2]}',
+        '6. {"action":"crop_image","bbox":[x1,y1,x2,y2]}',
+        '7. {"action":"retrieve_evidence","query":"...","scope":"current_page|nearby_pages|same_document|corpus","anchor":{"source_file":"...","page":页码,"bbox":[x1,y1,x2,y2]},"top_k":整数}',
+        '8. {"action":"open_evidence","evidence_id":"ev_xxx"}',
+        f'9. {{"action":"write_claim","field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}',
+        '10. {"action":"abstain_claim","field":"字段名","reason":"证据不足原因"}',
+        *claim_tool_lines,
         "约束：只输出一个 JSON 对象；不要输出 markdown；不要编造作品名、画家、朝代、技法；证据不足就 abstain。",
         "历史动作（保留最近若干步）：",
         json.dumps(history, ensure_ascii=False, separators=(",", ":")),
         "工具返回摘要（保留最近若干条，每条检索只保留前几个候选证据）：",
         json.dumps(tool_results, ensure_ascii=False, separators=(",", ":")),
+        "已选择 evidence_ids：",
+        json.dumps(row.get("selected_evidence_ids") or [], ensure_ascii=False, separators=(",", ":")),
+        "当前阶段允许的工具：",
+        json.dumps(row.get("available_actions") or [], ensure_ascii=False, separators=(",", ":")),
+        "阶段约束：如果当前阶段允许的工具列表非空，输出 JSON 的 action 必须严格从该列表中选择；总工具表中的其他工具此时禁止使用。",
+        f"阶段提示：{row.get('phase_hint') or ''}",
+        "当前 claim_state：",
+        json.dumps(claim_state, ensure_ascii=False, separators=(",", ":")),
         "当前 claims：",
         json.dumps(draft_claims, ensure_ascii=False, separators=(",", ":")),
         "请根据当前状态选择下一步工具调用。只输出一个 JSON 对象。",
@@ -510,7 +833,7 @@ def build_compact_prompt_text(row: dict[str, Any], args: argparse.Namespace) -> 
     if args.coordinate_info:
         image_info = [{"index": i + 1, "path": path, "size": image_size(path)} for i, path in enumerate(images)]
         lines.insert(5, f"图像尺寸：{json.dumps(image_info, ensure_ascii=False, separators=(',', ':'))}")
-        lines.insert(6, "坐标规则：所有 bbox 都使用第 1 张 PDF 页面图像的像素坐标，原点在左上角，格式为 [x1,y1,x2,y2]；如果页面上有红框，crop_image 必须裁剪红框范围。")
+        lines.insert(6, "坐标规则：所有候选 region 和 bbox 都使用第 1 张 PDF 页面图像的像素坐标，原点在左上角，格式为 [x1,y1,x2,y2]；无红框页面优先用 propose_regions 查看候选区域，如果候选区域带 caption_evidence_id，可用 select_evidence 显式选择证据，再用 crop_region 查看目标区域。")
     return "\n".join(lines)
 
 
@@ -527,13 +850,21 @@ def extract_meta_from_prompt(prompt_text: str) -> dict[str, Any]:
 def simplify_action(action: Any) -> Any:
     if not isinstance(action, dict):
         return action
-    keep = {k: action.get(k) for k in ["action", "bbox", "field", "evidence_id", "scope", "top_k", "value", "reason"] if k in action}
+    keep = {
+        k: action.get(k)
+        for k in ["action", "bbox", "region_id", "field", "evidence_id", "scope", "top_k", "value", "reason", "status"]
+        if k in action
+    }
     if "query" in action:
         keep["query"] = truncate_text(str(action.get("query", "")), 120)
     if "anchor" in action:
         keep["anchor"] = action.get("anchor")
     if "evidence_ids" in action:
         keep["evidence_ids"] = action.get("evidence_ids")
+    if "claims" in action:
+        keep["claims"] = action.get("claims")
+    if "abstains" in action:
+        keep["abstains"] = action.get("abstains")
     return keep
 
 
@@ -541,8 +872,29 @@ def simplify_tool_result(result: Any, args: argparse.Namespace) -> Any:
     if not isinstance(result, dict):
         return result
     tool = result.get("tool")
-    if tool == "crop_image":
-        return {"tool": "crop_image", "bbox": result.get("bbox"), "crop_path": result.get("crop_path")}
+    if tool in {"crop_image", "crop_region", "crop_target"}:
+        keep = {"tool": tool, "bbox": result.get("bbox"), "crop_path": result.get("crop_path")}
+        if "region_id" in result:
+            keep["region_id"] = result.get("region_id")
+        return keep
+    if tool in {"propose_regions", "inspect_page"} and result.get("regions"):
+        return {
+            "tool": tool,
+            "regions": [
+                {
+                    "region_id": item.get("region_id"),
+                    "bbox": item.get("bbox"),
+                    "type": item.get("type"),
+                    "source": item.get("source"),
+                    "score": item.get("score"),
+                    "nearby_text": truncate_text(str(item.get("nearby_text", "")), 120) if item.get("nearby_text") else None,
+                    "caption_evidence_id": item.get("caption_evidence_id"),
+                    "caption_hint": truncate_text(str(item.get("caption_hint", "")), 120) if item.get("caption_hint") else None,
+                    "hint": truncate_text(str(item.get("hint", "")), 120) if item.get("hint") else None,
+                }
+                for item in (result.get("regions") or [])[: args.max_evidence_per_result * 2]
+            ],
+        }
     if tool == "retrieve_evidence":
         return {
             "tool": "retrieve_evidence",
@@ -550,6 +902,16 @@ def simplify_tool_result(result: Any, args: argparse.Namespace) -> Any:
             "query": truncate_text(str(result.get("query", "")), 120),
             "anchor": result.get("anchor"),
             "results": [simplify_evidence(item, args) for item in (result.get("results") or [])[: args.max_evidence_per_result]],
+        }
+    if tool == "select_evidence":
+        return {
+            "tool": "select_evidence",
+            "selected_evidence_ids": result.get("selected_evidence_ids") or [],
+            "selected_evidence": [
+                simplify_evidence(item, args)
+                for item in (result.get("selected_evidence") or [])[: args.max_evidence_per_result]
+            ],
+            "rejected_evidence_ids": result.get("rejected_evidence_ids") or [],
         }
     if tool == "open_evidence":
         simplified = {"tool": "open_evidence", "evidence_id": result.get("evidence_id")}
