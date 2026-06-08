@@ -36,6 +36,17 @@ SCHEMA_ACTIONS = {
         "write_claims_batch",
         "finish",
     },
+    "no_select": {
+        "inspect_page",
+        "crop_target",
+        "retrieve_evidence",
+        "open_evidence",
+        "write_claim",
+        "abstain_claim",
+        "write_claims_chunk",
+        "write_claims_batch",
+        "finish",
+    },
 }
 
 
@@ -88,6 +99,18 @@ def phase_aware_tool_mask(obs: dict[str, Any]) -> dict[str, Any]:
     has_selected = bool(obs.get("selected_evidence_ids")) or "select_evidence" in history_actions or "select_evidence" in tool_names
     has_evidence = has_selected or has_opened
     has_claims = bool(written_fields or abstained_fields or obs.get("draft_claims"))
+
+    if str(obs.get("tool_schema") or "") == "no_select":
+        return no_select_phase_mask(
+            obs,
+            remaining_fields=remaining_fields,
+            has_regions=has_regions,
+            has_crop=has_crop,
+            has_retrieved=has_retrieved,
+            retrieved_count=retrieved_count,
+            opened_count=opened_count,
+            has_claims=has_claims,
+        )
 
     if has_claims:
         return decision(
@@ -163,6 +186,90 @@ def phase_aware_tool_mask(obs: dict[str, Any]) -> dict[str, Any]:
         "evidence_opening",
         ["select_evidence", "open_evidence", "retrieve_evidence", "write_claim", "write_claims_chunk"],
         "retrieval results are available; open/select evidence, or write if enough evidence is already visible.",
+        obs,
+    )
+
+
+def no_select_phase_mask(
+    obs: dict[str, Any],
+    *,
+    remaining_fields: list[Any],
+    has_regions: bool,
+    has_crop: bool,
+    has_retrieved: bool,
+    retrieved_count: int,
+    opened_count: int,
+    has_claims: bool,
+) -> dict[str, Any]:
+    """Phase mask for the v1.0.3 no-select protocol.
+
+    The model never calls select_evidence in this protocol. Evidence becomes
+    usable when it is visible in the observation, returned by retrieval, or
+    opened explicitly.
+    """
+
+    if not remaining_fields:
+        return decision(
+            "finish_ready",
+            ["finish"],
+            "claim_state has no remaining fields; finish the trajectory.",
+            obs,
+        )
+
+    if has_claims:
+        return decision(
+            "claim_continuation",
+            ["write_claim", "write_claims_chunk", "abstain_claim"],
+            "claims have already started and remaining fields still exist; continue writing or abstain remaining fields before finish.",
+            obs,
+        )
+
+    if not has_regions:
+        return decision(
+            "region_discovery",
+            ["inspect_page"],
+            "the page has not been inspected; inspect_page is required before crop_target.",
+            obs,
+        )
+
+    if not has_crop:
+        return decision(
+            "region_selection",
+            ["crop_target"],
+            "layout regions are available; crop_target must crop the target figure region before evidence use.",
+            obs,
+        )
+
+    visible_count = len(obs.get("visible_evidence_ids") or [])
+    if not has_retrieved and opened_count == 0:
+        allowed = ["open_evidence", "retrieve_evidence"] if visible_count else ["retrieve_evidence"]
+        return decision(
+            "local_evidence_opening",
+            allowed,
+            "target region has been cropped; open one visible local caption evidence if available, otherwise retrieve evidence.",
+            obs,
+        )
+
+    if not has_retrieved:
+        return decision(
+            "evidence_retrieval_after_open",
+            ["retrieve_evidence", "write_claim", "write_claims_chunk", "abstain_claim"],
+            "one local evidence item has already been opened; retrieve more evidence or write/abstain if the local evidence is sufficient.",
+            obs,
+        )
+
+    if retrieved_count < 3 and opened_count < 4:
+        return decision(
+            "evidence_opening",
+            ["open_evidence", "retrieve_evidence", "write_claim", "write_claims_chunk", "abstain_claim"],
+            "retrieval results are available; open evidence, optionally retrieve again within budget, or write claims.",
+            obs,
+        )
+
+    return decision(
+        "claim_ready",
+        ["open_evidence", "write_claim", "write_claims_chunk", "abstain_claim"],
+        "enough evidence has been retrieved/opened; write claims instead of continuing broad retrieval.",
         obs,
     )
 

@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tool-schema",
-        choices=["highlighted_direct", "region", "evidence_select", "chunked_claim", "inspect_crop"],
+        choices=["highlighted_direct", "region", "evidence_select", "chunked_claim", "inspect_crop", "no_select"],
         default="chunked_claim",
     )
     parser.add_argument("--seed", type=int, default=42)

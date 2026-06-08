@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(
         "--tool-schema",
-        choices=["highlighted_direct", "region", "evidence_select", "chunked_claim", "inspect_crop"],
+        choices=["highlighted_direct", "region", "evidence_select", "chunked_claim", "inspect_crop", "no_select"],
         default="evidence_select",
     )
     parser.add_argument("--max-history-actions", type=int, default=8)
@@ -128,7 +128,7 @@ def main() -> int:
         tool_schema=args.tool_schema,
         compact_claim_state=args.compact_claim_state
         if args.compact_claim_state is not None
-        else args.tool_schema == "chunked_claim",
+        else args.tool_schema in {"chunked_claim", "inspect_crop", "no_select"},
         region_selection_hint=args.region_selection_hint,
         strict_claim_phase_hint=args.strict_claim_phase_hint,
         dynamic_tool_schema=args.dynamic_tool_schema,
@@ -206,20 +206,19 @@ def run_one(
         tool_mask = obs.get("tool_mask") or {}
         available_actions = list(obs.get("available_actions") or [])
         prediction = policy.act(obs)
-        pred_action_name = (
-            str(prediction["action"].get("action", ""))
-            if isinstance(prediction.get("action"), dict)
-            else "invalid"
-        )
-        mask_violation = bool(available_actions and pred_action_name not in set(available_actions))
         action = prediction["action"] if prediction["action"] is not None else prediction["raw_text"]
         obs, reward, terminated, info = env.step(action)
         result = info.get("result") or {}
+        executed_action = env.history[-1] if env.history else None
+        parsed_action = executed_action if isinstance(executed_action, dict) and "action" in executed_action else None
+        action_name = parsed_action.get("action", "invalid") if isinstance(parsed_action, dict) else "invalid"
+        mask_violation = bool(available_actions and action_name not in set(available_actions))
         steps.append(
             {
                 "step": step_index,
                 "raw_text": prediction["raw_text"],
-                "parsed_action": prediction["action"],
+                "model_parsed_action": prediction["action"],
+                "parsed_action": parsed_action,
                 "available_actions": available_actions,
                 "tool_mask": tool_mask,
                 "mask_violation": mask_violation,
@@ -230,7 +229,6 @@ def run_one(
             }
         )
         if args.print_steps:
-            action_name = prediction["action"].get("action", "invalid") if isinstance(prediction["action"], dict) else "invalid"
             print(
                 json.dumps(
                     {

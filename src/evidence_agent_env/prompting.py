@@ -69,6 +69,8 @@ def build_prompt_text(obs: dict[str, Any], config: PromptConfig) -> str:
         target_line = "目标：根据 PDF 页面、候选区域、候选证据、局部裁剪图和可追溯证据，为目标山水画图像选择可信 evidence_id，并写出有证据支撑的结构化 claim。"
     elif config.tool_schema == "inspect_crop":
         target_line = "目标：先检查 PDF 页面布局，再裁剪目标山水画图像，之后检索证据并写出有证据支撑的结构化 claim。"
+    elif config.tool_schema == "no_select":
+        target_line = "目标：先检查 PDF 页面布局，再裁剪目标山水画图像，之后直接打开/检索可见证据并写出有证据支撑的结构化 claim；本协议不使用 select_evidence。"
     else:
         target_line = "目标：根据 PDF 页面图像、局部裁剪图和可追溯证据，为红框/目标山水画图像写出有证据支撑的结构化 claim。"
     lines = [
@@ -137,17 +139,27 @@ def build_prompt_text(obs: dict[str, Any], config: PromptConfig) -> str:
                     separators=(",", ":"),
                 )
             )
+    evidence_id_rule = (
+        "当前可用 evidence_ids（open_evidence/write_claims_chunk/write_claim/write_claims_batch 只能使用这里或工具返回里明确出现过的 id；必须逐字符原样复制完整 id，包括所有下划线；禁止编造 ev_888、ev_xxx 等占位 id）："
+        if config.tool_schema == "no_select"
+        else "当前可用 evidence_ids（open_evidence/select_evidence/write_claims_chunk 只能使用这里或工具返回里明确出现过的 id；必须逐字符原样复制完整 id，包括所有下划线；禁止编造 ev_888、ev_xxx 等占位 id）："
+    )
+    tool_order_rule = (
+        "工具顺序约束：open_evidence 不是搜索工具，只能打开当前可用 evidence_ids 中已经出现的 id；crop 后最多先打开 1 条可见 local evidence，之后应 retrieve_evidence 或 write_claims_chunk，不要反复 open_evidence；本协议禁止 select_evidence。"
+        if config.tool_schema == "no_select"
+        else "工具顺序约束：open_evidence 不是搜索工具，只能打开当前可用 evidence_ids 中已经出现的 id；crop 后最多先打开 1 条可见 local evidence，之后应 retrieve_evidence 或 write_claims_chunk，不要反复 open_evidence。"
+    )
     lines.extend(
         [
             "约束：只输出一个 JSON 对象；不要输出 markdown；不要编造作品名、画家、朝代、技法；证据不足就 abstain；如果给出了当前阶段允许的工具，action 必须在该列表中；done 不是 action 名，完成时只能输出 {\"action\":\"finish\",\"status\":\"done\"}，且只有 finish 出现在允许工具中才可使用。",
-            "工具顺序约束：open_evidence 不是搜索工具，只能打开当前可用 evidence_ids 中已经出现的 id；crop 后最多先打开 1 条可见 local evidence，之后应 retrieve_evidence 或 write_claims_chunk，不要反复 open_evidence。",
+            tool_order_rule,
             "历史动作（保留最近若干步）：",
             json.dumps(history, ensure_ascii=False, separators=(",", ":")),
             "工具返回摘要（保留最近若干条，每条检索只保留前几个候选证据）：",
             json.dumps(tool_results, ensure_ascii=False, separators=(",", ":")),
             "已选择 evidence_ids：",
             json.dumps(obs.get("selected_evidence_ids") or [], ensure_ascii=False, separators=(",", ":")),
-            "当前可用 evidence_ids（open_evidence/select_evidence/write_claims_chunk 只能使用这里或工具返回里明确出现过的 id；禁止编造 ev_888、ev_xxx 等占位 id）：",
+            evidence_id_rule,
             json.dumps(obs.get("visible_evidence_ids") or [], ensure_ascii=False, separators=(",", ":")),
             "当前 claim_state（优先依据它判断已写字段和剩余字段）：",
             json.dumps(current_claim_state, ensure_ascii=False, separators=(",", ":")),
@@ -165,7 +177,7 @@ def final_action_guard(obs: dict[str, Any], config: PromptConfig, current_claim_
     if not allowed:
         return "最终动作约束：未提供阶段 mask；按工具顺序选择下一步。"
     phase = (obs.get("tool_mask") or {}).get("phase") if isinstance(obs.get("tool_mask"), dict) else None
-    if config.tool_schema == "inspect_crop" and phase == "region_selection":
+    if config.tool_schema in {"inspect_crop", "no_select"} and phase == "region_selection":
         preferred_crop = "crop_target" if "crop_target" in allowed else "crop_region"
         ranked = [
             item
@@ -200,6 +212,14 @@ def final_action_guard(obs: dict[str, Any], config: PromptConfig, current_claim_
                 "也可以用 write_claim 写单个字段。visual_elements、composition 等长字段必须简短，不要输出重复长数组。"
             )
         return "最终动作约束：当前字段已经完成，本步应输出 {\"action\":\"finish\",\"status\":\"done\"}。"
+    if phase in {"local_evidence_opening", "evidence_retrieval_after_open", "evidence_opening"} and "retrieve_evidence" in allowed:
+        return (
+            "最终动作约束：本步如果调用 retrieve_evidence，query 必须短且可闭合为合法 JSON："
+            "query 长度不超过 80 个汉字/英文词，禁止重复同一个词组或作品名，禁止把整段证据复制进 query；"
+            "优先用 source_file 短标题 + 当前图注关键词 + 山水画/桥梁/构图等 1-3 个检索词。"
+            "如果当前阶段还允许 write_claims_chunk 且本地 evidence 已足够，也可以直接写 claim；"
+            "无论选择哪个 action，都必须输出完整闭合的单个 JSON 对象。"
+        )
     if len(allowed) == 1:
         return f"最终动作约束：当前阶段唯一允许的 action 是 {allowed[0]}，输出其他 action 会被判为非法。"
     return "最终动作约束：本步 action 必须属于当前阶段允许的工具列表：" + json.dumps(
@@ -208,14 +228,15 @@ def final_action_guard(obs: dict[str, Any], config: PromptConfig, current_claim_
 
 
 def claim_phase_hint(obs: dict[str, Any], config: PromptConfig, current_claim_state: dict[str, Any]) -> str:
-    if config.tool_schema not in {"chunked_claim", "inspect_crop"}:
+    if config.tool_schema not in {"chunked_claim", "inspect_crop", "no_select"}:
         return ""
     phase = (obs.get("tool_mask") or {}).get("phase") if isinstance(obs.get("tool_mask"), dict) else None
     remaining = current_claim_state.get("remaining_fields") or []
     if config.strict_claim_phase_hint and phase in {"claim_writing", "claim_continuation"}:
         if remaining:
+            blocked_tools = "open_evidence、retrieve_evidence" if config.tool_schema == "no_select" else "open_evidence、retrieve_evidence 或 select_evidence"
             return (
-                "阶段提示：当前已经进入 claim 写入阶段，当前阶段禁止继续 open_evidence、retrieve_evidence 或 select_evidence。"
+                f"阶段提示：当前已经进入 claim 写入阶段，当前阶段禁止继续 {blocked_tools}。"
                 "如果 current_claim_state.remaining_fields 仍有字段，下一步必须优先调用 write_claims_chunk，"
                 "一次只写 1 个尚未写过的字段；也可以用 write_claim 写单个字段。"
                 "证据不足的字段用 abstain_claim 或 write_claims_chunk.abstains。"
@@ -231,9 +252,10 @@ def claim_phase_hint(obs: dict[str, Any], config: PromptConfig, current_claim_st
     has_prepared_image = any(tool in tool_names for tool in ["crop_region", "crop_target", "crop_image"])
     has_retrieved = "retrieve_evidence" in history_actions or "retrieve_evidence" in tool_names
     if has_evidence and (has_prepared_image or has_retrieved):
+        evidence_phrase = "已有 open_evidence 或工具返回中的 evidence" if config.tool_schema == "no_select" else "已有 selected_evidence_ids 或工具返回中的 evidence"
         return (
             "阶段提示：当前通常已经完成候选区域选择、裁剪、证据检索和证据打开；"
-            "如果 claim_state 显示仍有待写字段，并且已有 selected_evidence_ids 或工具返回中的 evidence，"
+            f"如果 claim_state 显示仍有待写字段，并且{evidence_phrase}，"
             "优先调用 write_claims_chunk 写入下一组结构化 claim。"
             "每次只写 1 个字段，复杂字段必须简短。除非明确缺少必要证据，否则不要继续 open_evidence 或 finish。"
         )
@@ -243,7 +265,7 @@ def claim_phase_hint(obs: dict[str, Any], config: PromptConfig, current_claim_st
 def region_selection_phase_hint(obs: dict[str, Any], config: PromptConfig) -> str:
     if not config.region_selection_hint:
         return ""
-    if config.tool_schema not in {"region", "evidence_select", "chunked_claim", "inspect_crop"}:
+    if config.tool_schema not in {"region", "evidence_select", "chunked_claim", "inspect_crop", "no_select"}:
         return ""
     history_actions = [item.get("action") for item in obs.get("history") or [] if isinstance(item, dict)]
     tool_names = [item.get("tool") for item in obs.get("tool_results") or [] if isinstance(item, dict)]
@@ -285,7 +307,7 @@ def tool_schema_lines(schema: str, allowed_actions: list[str] | None = None) -> 
     def keep(action: str) -> bool:
         return not allowed or action in allowed
 
-    if schema == "inspect_crop":
+    if schema in {"inspect_crop", "no_select"}:
         rows = [
             ("inspect_page", '{"action":"inspect_page","top_k":整数}'),
             ("crop_target", '{"action":"crop_target","region_id":"r_xxx"} 或 {"action":"crop_target","bbox":[x1,y1,x2,y2]}'),
@@ -294,26 +316,28 @@ def tool_schema_lines(schema: str, allowed_actions: list[str] | None = None) -> 
                 '{"action":"retrieve_evidence","query":"...","scope":"current_page|nearby_pages|same_document|corpus","anchor":{"source_file":"...","page":页码,"bbox":[x1,y1,x2,y2]},"top_k":整数}',
             ),
             ("open_evidence", '{"action":"open_evidence","evidence_id":"ev_xxx"}'),
-            ("select_evidence", '{"action":"select_evidence","evidence_ids":["ev_xxx或local_caption_xxx"]}'),
             (
                 "write_claims_chunk",
-                f'{{"action":"write_claims_chunk","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
+                f'{{"action":"write_claims_chunk","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["从当前可用evidence_ids原样复制"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
             ),
             (
                 "write_claim",
-                f'{{"action":"write_claim","field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}',
+                f'{{"action":"write_claim","field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["从当前可用evidence_ids原样复制"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}',
             ),
             ("abstain_claim", '{"action":"abstain_claim","field":"字段名","reason":"证据不足原因"}'),
             (
                 "write_claims_batch",
-                f'{{"action":"write_claims_batch","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
+                f'{{"action":"write_claims_batch","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["从当前可用evidence_ids原样复制"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
             ),
             ("finish", '{"action":"finish","status":"done"}'),
         ]
         lines = ["当前可用工具格式示例："]
         filtered = [text for action, text in rows if keep(action)]
         lines.extend(f"{idx}. {text}" for idx, text in enumerate(filtered, start=1))
-        lines.append("工具顺序：inspect_page -> crop_target -> retrieve/open/select evidence -> write_claims_chunk/write_claim/abstain_claim -> finish。")
+        if schema == "no_select":
+            lines.append("工具顺序：inspect_page -> crop_target -> open_evidence(可见 local_caption_id，可选) -> retrieve_evidence -> open_evidence(检索结果，可选) -> write_claims_chunk/write_claim/abstain_claim -> finish；禁止 select_evidence。")
+        else:
+            lines.append("工具顺序：inspect_page -> crop_target -> retrieve/open/select evidence -> write_claims_chunk/write_claim/abstain_claim -> finish。")
         return lines
     if schema == "chunked_claim":
         return [
@@ -375,6 +399,11 @@ def coordinate_rule(schema: str) -> str:
         return (
             "坐标规则：inspect_page 会返回 layout regions；region bbox 和 crop_target 的 bbox 都使用第 1 张 PDF 原始页面图像的像素坐标，原点在左上角，格式为 [x1,y1,x2,y2]；"
             "当前页面没有红框，先用 inspect_page 检查页面布局，再用 crop_target 裁剪目标图像；下一步工具必须服从“当前阶段允许的工具”列表。"
+        )
+    if schema == "no_select":
+        return (
+            "坐标规则：inspect_page 会返回 layout regions；region bbox 和 crop_target 的 bbox 都使用第 1 张 PDF 原始页面图像的像素坐标，原点在左上角，格式为 [x1,y1,x2,y2]；"
+            "当前页面没有红框，先用 inspect_page 检查页面布局，再用 crop_target 裁剪目标图像；证据 id 可直接由 open_evidence/write_claims_chunk 使用，不调用 select_evidence。"
         )
     if schema in {"region", "evidence_select", "chunked_claim"}:
         return (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
@@ -49,10 +50,43 @@ def parse_action(action: str | dict[str, Any]) -> tuple[dict[str, Any] | None, s
     try:
         parsed = json.loads(action)
     except json.JSONDecodeError as exc:
+        repaired = repair_truncated_retrieve_action(action)
+        if repaired is not None:
+            return repaired, None
         return None, f"invalid JSON: {exc}"
     if not isinstance(parsed, dict):
         return None, "action JSON must be an object"
     return normalize_action_shape(parsed), None
+
+
+def repair_truncated_retrieve_action(text: str) -> dict[str, Any] | None:
+    """Recover a narrow class of truncated retrieve_evidence calls.
+
+    Small VLMs occasionally start a valid retrieve_evidence JSON object, then
+    repeat the query until generation stops before the closing quote. This
+    repair keeps the intended tool call but caps the query aggressively. It
+    does not repair unknown actions, malformed evidence ids, or claim JSON.
+    """
+
+    if '"action"' not in text or "retrieve_evidence" not in text or '"query"' not in text:
+        return None
+    action_match = re.search(r'"action"\s*:\s*"retrieve_evidence"', text)
+    query_match = re.search(r'"query"\s*:\s*"(?P<query>.*)$', text, flags=re.DOTALL)
+    if not action_match or not query_match:
+        return None
+    query = query_match.group("query")
+    query = query.split("\ufffd")[0]
+    query = query.split('","scope"')[0]
+    query = re.sub(r"\s+", " ", query).strip()
+    if not query:
+        return None
+    return {
+        "action": "retrieve_evidence",
+        "query": query[:120],
+        "scope": "same_document",
+        "top_k": 5,
+        "_parse_repaired": "truncated_retrieve_query",
+    }
 
 
 def normalize_action_shape(action: dict[str, Any]) -> dict[str, Any]:

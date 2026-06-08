@@ -451,7 +451,12 @@ class EvidenceAgentEnv:
             match_score, match_reason = self._target_caption_match(linked_caption_text)
             item["target_caption_match_score"] = match_score
             item["target_caption_match_reason"] = match_reason
-        self._rank_target_regions(linked_regions)
+        has_precomputed_target_rank = any(
+            item.get("type") == "figure_candidate" and item.get("target_region_rank") is not None
+            for item in linked_regions
+        )
+        if not has_precomputed_target_rank:
+            self._rank_target_regions(linked_regions)
         return linked_regions
 
     @staticmethod
