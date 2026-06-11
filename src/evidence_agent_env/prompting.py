@@ -13,6 +13,13 @@ CLAIM_FIELD_SPEC = (
     "caption_text|image_scope|depicted_work_title|displayed_region|object_type|artist|dynasty|"
     "visual_elements|technique|composition|medium_dimensions|collection"
 )
+EVIDENCE_POLICY_KEYS = [
+    "clean_evidence_type",
+    "adjudicated_evidence_role",
+    "adjudication_status",
+    "adjudicated_claim_allowed_fields",
+    "usable_for_claim_by_adjudication",
+]
 
 
 @dataclass
@@ -152,6 +159,7 @@ def build_prompt_text(obs: dict[str, Any], config: PromptConfig) -> str:
     lines.extend(
         [
             "约束：只输出一个 JSON 对象；不要输出 markdown；不要编造作品名、画家、朝代、技法；证据不足就 abstain；如果给出了当前阶段允许的工具，action 必须在该列表中；done 不是 action 名，完成时只能输出 {\"action\":\"finish\",\"status\":\"done\"}，且只有 finish 出现在允许工具中才可使用。",
+            "证据边界约束：如果证据摘要包含 adjudicated_claim_allowed_fields，只能用该 evidence 支持这些字段；如果 usable_for_claim_by_adjudication=false 或 adjudication_status 不是 accepted_auto，应对该字段 abstain 或继续检索。",
             tool_order_rule,
             "历史动作（保留最近若干步）：",
             json.dumps(history, ensure_ascii=False, separators=(",", ":")),
@@ -522,6 +530,9 @@ def simplify_tool_result(result: Any, config: PromptConfig) -> Any:
         for key in ["source_file", "page_start", "page_end", "authority_level", "citation_level", "source_quality"]:
             if key in result:
                 simplified[key] = result.get(key)
+        for key in EVIDENCE_POLICY_KEYS:
+            if key in result and result.get(key) is not None:
+                simplified[key] = result.get(key)
         for key in ["display_snippet", "evidence_summary", "text", "raw_chunk_text"]:
             if result.get(key):
                 simplified[key] = truncate_text(str(result.get(key)), config.snippet_chars)
@@ -547,7 +558,7 @@ def simplify_evidence(item: Any, config: PromptConfig) -> Any:
     if not isinstance(item, dict):
         return item
     snippet = item.get("evidence_summary") or item.get("display_snippet") or item.get("text") or ""
-    return {
+    simplified = {
         "evidence_id": item.get("evidence_id"),
         "source_file": item.get("source_file"),
         "page_start": item.get("page_start"),
@@ -557,6 +568,10 @@ def simplify_evidence(item: Any, config: PromptConfig) -> Any:
         "score": item.get("score"),
         "snippet": truncate_text(str(snippet), config.snippet_chars),
     }
+    for key in EVIDENCE_POLICY_KEYS:
+        if key in item and item.get(key) is not None:
+            simplified[key] = item.get(key)
+    return simplified
 
 
 def truncate_text(text: str, max_chars: int) -> str:

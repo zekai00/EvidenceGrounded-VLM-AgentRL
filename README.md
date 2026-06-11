@@ -1,202 +1,225 @@
 # EvidenceGrounded-VLM-AgentRL
 
-<p align="center">
-  <a href="#中文"><kbd>中文</kbd></a>
-  <a href="#english"><kbd>English</kbd></a>
-</p>
+EvidenceGrounded-VLM-AgentRL is a VLM agentic RL project for evidence-grounded multimodal document understanding.
 
-## 中文
+The current main task is to train and evaluate a vision-language tool-call agent that reads Chinese landscape-painting PDF literature, locates the target artwork image, retrieves/open evidence, and writes structured claims only when the evidence supports them.
 
-EvidenceGrounded-VLM-AgentRL 是一个面向多模态文档理解的 VLM 工具调用强化学习项目。
+## Current Status
 
-项目目标是训练一个视觉语言模型，让它在阅读复杂 PDF 页面、图像区域和文本证据时，不是一次性给出答案，而是通过多步工具调用主动取证、引用证据、写入结构化结论，并在证据不足时拒答。
+Current version: `v1.0.4`
 
-核心任务定义：
+Current best configuration:
 
-```text
-Claim-Level Evidence-Seeking VLM Agent for multimodal document understanding
-```
+- Base model: `/root/models/Qwen2.5-VL-3B-Instruct`
+- Best adapter: `/root/models/evidence_grounded_vlm_agentrl/qwen25vl3b_v1_0_2b_sft3000_from_phase8_20260608_0316/adapter`
+- Runtime: v1.0.4 overlay verifier + `retrieve_evidence.scope` repair + no-select tool schema + phase-aware mask
+- Evidence index: `/root/datasets/evidence_grounded_vlm_agentrl/evidence_index_v1_0_4_llm_overlay_20260611_0222`
+- Trusted evaluation set: `/root/datasets/evidence_grounded_vlm_agentrl/gold_eval_v1_0_4_caption_corrected_20260611_1830`
 
-也就是：给定一个多模态文档任务，模型需要围绕每个 claim 主动寻找证据，并输出可追溯、可验证的结果。
+This repository is no longer at the early next-action SFT stage. The current bottleneck is not crop quality. On GoldEval, target crop/region selection is already stable. The main bottleneck is field-level claim grounding:
 
-### 为什么需要 Agent
+- whether each non-abstain claim cites valid `evidence_ids`;
+- whether cited evidence can actually support the claim field;
+- whether the model abstains only when evidence is insufficient;
+- whether final claims remain supported after retrieve/open/write tool use.
 
-很多多模态文档任务不是单张图片问答。模型需要先定位相关区域，再检索上下文证据，再判断证据是否足够支持某个结构化字段。这个过程天然是多步的：
+## Agent Workflow
 
-```text
-observe page -> inspect/crop region -> retrieve evidence -> open evidence -> write or abstain -> finish
-```
-
-因此，本项目重点研究：
-
-- VLM tool-call trajectory learning；
-- evidence-grounded multimodal reasoning；
-- verifier-guided reinforcement learning；
-- unsupported claim 和 hallucination 控制；
-- 可执行、可复现的多模态 agent environment。
-
-### 当前进展
-
-已完成第一版离线数据与 SFT 验证：
-
-- 构建了证据索引和多步工具调用轨迹数据；
-- 引入了低文本页面的 VLM 辅助转写流程；
-- 训练了 Qwen2.5-VL-3B LoRA trajectory SFT adapter；
-- 完成了生成式 next-action 评测；
-- 明确了下一阶段从 `crop_image(bbox)` 迁移到 `propose_regions -> crop_region(region_id)` 的可执行环境方案。
-
-当前 SFT adapter 在 held-out next-action 评测中的核心结果：
-
-| split | valid action | action type | evidence overlap | retrieval scope |
-|---|---:|---:|---:|---:|
-| validation | 1.000 | 0.825 | 0.817 | 0.750 |
-| test | 0.992 | 0.858 | 0.858 | 0.900 |
-
-这些指标说明模型已经能较稳定地产生合法工具调用，并初步学会在证据检索和 claim 写入之间建立联系。
-
-### 方法概览
-
-当前训练链路分为四步：
-
-1. Evidence indexing：从多模态文档中构建可检索证据块。
-2. Trajectory SFT：把专家轨迹拆成“当前观察 + 历史 + 工具返回 -> 下一步 action”的监督样本。
-3. Executable environment：实现 `reset/step` 风格的工具调用环境，使模型输出可以被真实执行。
-4. On-policy RL：使用 verifier 对完整 trajectory 打分，对比 step-wise verifier-guided GRPO 和 trajectory-level clipped GRPO。
-
-### 主要研究问题
-
-- 小参数 VLM 是否能学会稳定的多步工具调用？
-- 候选区域选择是否比直接预测像素级 bbox 更适合文档 agent？
-- verifier-guided reward 能否提升证据命中率和拒答能力？
-- clipped ratio、reference KL、SFT replay 对 VLM agentic RL 的稳定性有什么影响？
-
-### 代码结构
+The no-select runtime currently follows this high-level workflow:
 
 ```text
-configs/     Experiment configuration
-scripts/     Data construction, training, and evaluation scripts
-src/         Environment, tools, verifier, and agent modules
-```
-
-大型数据、模型权重、实验输出和内部报告不会提交到本仓库。
-
-### 下一步
-
-下一阶段将实现可执行工具调用环境：
-
-```text
-reset
--> propose_regions
--> crop_region
--> retrieve_evidence
--> open_evidence
--> write_claim / abstain_claim
+inspect_page
+-> crop_target
+-> open_evidence(local_caption)
+-> retrieve_evidence, if more evidence is needed
+-> open_evidence(retrieved evidence)
+-> write_claims_chunk / abstain
 -> finish
 ```
 
-然后在同一 verifier 下对比：
+This is not a rigid requirement to call every tool exactly once. The key rules are:
 
-- SFT only；
-- step-wise verifier-guided GRPO；
-- trajectory-level GRPO；
-- trajectory-level GRPO with clipped ratio；
-- trajectory-level GRPO with clipped ratio and reference KL。
+- inspect and crop before writing claims;
+- use local caption when it is sufficient;
+- retrieve/open external evidence when non-caption fields need support;
+- every non-abstain claim must include evidence IDs;
+- if evidence is insufficient, abstain instead of guessing;
+- finish only after all target fields are written or abstained.
 
-## English
-
-EvidenceGrounded-VLM-AgentRL is a VLM tool-call reinforcement learning project for multimodal document understanding.
-
-The goal is to train a vision-language model to solve evidence-seeking document tasks through multi-step tool calls. Instead of producing a one-shot answer, the model must inspect visual regions, retrieve evidence, cite supporting snippets, write structured claims, and abstain when evidence is insufficient.
-
-Core task:
+Current GoldEval target fields are Core5:
 
 ```text
-Claim-Level Evidence-Seeking VLM Agent for multimodal document understanding
+caption_text
+image_scope
+depicted_work_title
+displayed_region
+object_type
 ```
 
-In this task, the model actively gathers evidence for each claim and produces traceable, verifiable outputs.
+## Key Results
 
-### Why Agentic Modeling
+### Caption-Corrected GoldEval Baseline
 
-Many multimodal document tasks are not single-image question answering problems. The model often needs to locate a relevant region, retrieve surrounding textual evidence, verify whether the evidence supports a structured field, and decide whether to answer or abstain.
+Report:
 
-The natural workflow is multi-step:
+`docs/03_实验报告/v1.0.4CaptionCorrectedGoldEvalVal50Test100评测与Guard负结果报告_20260611_2301.md`
 
-```text
-observe page -> inspect/crop region -> retrieve evidence -> open evidence -> write or abstain -> finish
+Baseline val50:
+
+| Metric | Value |
+|---|---:|
+| trajectory_success_rate | 0.960 |
+| finish_rate | 0.980 |
+| premature_finish_task_rate | 0.020 |
+| crop_success_rate | 1.000 |
+| mean_final_reward | 0.898754 |
+| mean_claim_supported_rate | 0.633667 |
+| mean_evidence_recall | 0.493334 |
+| no_retrieve_task_rate | 0.140 |
+| mean_negative_write_claim_count | 1.400 |
+
+Baseline test100:
+
+| Metric | Value |
+|---|---:|
+| trajectory_success_rate | 0.850 |
+| finish_rate | 0.970 |
+| premature_finish_task_rate | 0.030 |
+| crop_success_rate | 1.000 |
+| mean_final_reward | 0.894403 |
+| mean_claim_supported_rate | 0.619000 |
+| mean_evidence_recall | 0.578889 |
+| no_retrieve_task_rate | 0.050 |
+| mean_negative_write_claim_count | 1.910 |
+
+### Behavior Repair SFT Negative Result
+
+Report:
+
+`docs/03_实验报告/v1.0.4BehaviorRepairSFT训练评测负结果报告_20260612_0159.md`
+
+Two small LoRA continuation branches were trained from the current best adapter:
+
+- A: patch:replay = 30:70, 20 optimizer steps.
+- B: patch:replay = 40:60, 40 optimizer steps.
+
+Both were evaluated only on `val_gold_50`; `test_gold_100` was not used for selection.
+
+| Metric | Baseline | A replay70 20step | B replay60 40step |
+|---|---:|---:|---:|
+| trajectory_success_rate | 0.960 | 0.900 | 0.860 |
+| finish_rate | 0.980 | 1.000 | 1.000 |
+| premature_finish_task_rate | 0.020 | 0.000 | 0.000 |
+| mean_final_reward | 0.898754 | 0.824033 | 0.819815 |
+| mean_claim_supported_rate | 0.633667 | 0.351333 | 0.351333 |
+| mean_evidence_recall | 0.493334 | 0.544445 | 0.486667 |
+| mean_negative_write_claim_count | 1.400 | 2.180 | 2.140 |
+
+Decision:
+
+- Do not adopt A or B.
+- Do not run test100 for A/B.
+- Keep the v1.0.2b adapter as the current best.
+- Do not continue scaling the same behavior-repair recipe.
+
+The lesson is important: rule-like repair data can reduce premature finish and no-retrieve behavior, but it can also make the model worse at writing supported claims. The next patch must preserve positive claim-support behavior first, with hard negative/abstain samples kept small.
+
+## Reproducing Main Evaluation
+
+Baseline val50:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/collect_rollouts.py \
+  --tasks /root/datasets/evidence_grounded_vlm_agentrl/gold_eval_v1_0_4_caption_corrected_20260611_1830/val_gold_50.jsonl \
+  --evidence-index /root/datasets/evidence_grounded_vlm_agentrl/evidence_index_v1_0_4_llm_overlay_20260611_0222 \
+  --output-dir outputs/v1_0_4_gold_eval_caption_corrected_val50_bf16 \
+  --model /root/models/Qwen2.5-VL-3B-Instruct \
+  --adapter /root/models/evidence_grounded_vlm_agentrl/qwen25vl3b_v1_0_2b_sft3000_from_phase8_20260608_0316/adapter \
+  --max-steps 14 \
+  --tool-schema no_select --phase-aware-mask --enforce-tool-mask \
+  --strict-claim-phase-hint --dynamic-tool-schema \
+  --target-claim-fields-from-gold \
+  --no-load-in-4bit --torch-dtype bf16 \
+  --image-max-pixels 262144 --max-seq-length 14336 --max-new-tokens 256 \
+  --temperature 0.0 --no-print-steps
 ```
 
-This project focuses on:
+Build behavior repair data:
 
-- VLM tool-call trajectory learning;
-- evidence-grounded multimodal reasoning;
-- verifier-guided reinforcement learning;
-- unsupported-claim and hallucination control;
-- executable and reproducible multimodal agent environments.
+```bash
+python scripts/build_v1_0_4_behavior_repair_sft.py \
+  --dataset-suffix A_replay70 \
+  --replay-ratio 0.70 \
+  --max-patch-train 480 \
+  --max-patch-val 128 \
+  --seed 42
+```
 
-### Current Progress
+Train a continuation LoRA branch:
 
-The first offline data and SFT stage has been completed:
+```bash
+python scripts/train_trajectory_sft_lora.py \
+  --train-jsonl /root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_0_4_behavior_repair_sft_A_replay70_20260612_0006/sft/train.jsonl \
+  --val-jsonl /root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_0_4_behavior_repair_sft_A_replay70_20260612_0006/sft/val.jsonl \
+  --output-dir /root/models/evidence_grounded_vlm_agentrl/qwen25vl3b_v1_0_4_behavior_repair_A_replay70_20step \
+  --model /root/models/Qwen2.5-VL-3B-Instruct \
+  --adapter /root/models/evidence_grounded_vlm_agentrl/qwen25vl3b_v1_0_2b_sft3000_from_phase8_20260608_0316/adapter \
+  --epochs 0.1 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --learning-rate 1e-5 \
+  --prompt-mode compact \
+  --load-in-4bit --torch-dtype bf16 \
+  --training-record
+```
 
-- built an evidence index and multi-step tool-call trajectories;
-- added VLM-assisted transcription for low-text pages;
-- trained a Qwen2.5-VL-3B LoRA trajectory SFT adapter;
-- evaluated generative next-action prediction;
-- planned the migration from `crop_image(bbox)` to `propose_regions -> crop_region(region_id)` for the executable environment.
+Training automatically records:
 
-Current SFT adapter results on held-out next-action evaluation:
+- `train_log.jsonl`
+- `gpu_memory_monitor.jsonl`
+- `训练记录.md`
+- `training_assets/loss_curve.png`
+- `training_assets/gpu_memory_curve.png`
 
-| split | valid action | action type | evidence overlap | retrieval scope |
-|---|---:|---:|---:|---:|
-| validation | 1.000 | 0.825 | 0.817 | 0.750 |
-| test | 0.992 | 0.858 | 0.858 | 0.900 |
+## Documentation
 
-These results show that the model can reliably emit valid tool calls and has learned an initial connection between evidence retrieval and claim writing.
+Important docs:
 
-### Method Overview
+- `docs/codex-worklog.md`
+- `docs/01_规划与路线/`
+- `docs/02_指标与数据/`
+- `docs/03_实验报告/`
+- `docs/04_阶段性总结/`
+- `docs/05_相关资料/`
 
-The current training pipeline has four stages:
+Recent related-paper digest:
 
-1. Evidence indexing: build retrievable evidence chunks from multimodal documents.
-2. Trajectory SFT: convert expert trajectories into supervised samples of “current observation + history + tool results -> next action”.
-3. Executable environment: implement a `reset/step` tool-call environment where model actions are actually executed.
-4. On-policy RL: use a verifier to score complete trajectories and compare step-wise verifier-guided GRPO with trajectory-level clipped GRPO.
+`docs/05_相关资料/v1.0.4相关论文与实现导读_20260611.md`
 
-### Research Questions
+Note: `docs/` is treated as a local/internal report directory in `.gitignore`. The public GitHub repository tracks the runnable code and README; local reports and downloaded PDFs stay in the working machine unless explicitly force-added.
 
-- Can a compact VLM learn stable multi-step tool use?
-- Is region-candidate selection more robust than direct pixel-level bbox prediction for document agents?
-- Can verifier-guided rewards improve evidence hit rate and abstention behavior?
-- How do clipped ratio, reference KL, and SFT replay affect the stability of VLM agentic RL?
-
-### Repository Layout
+## Repository Layout
 
 ```text
 configs/     Experiment configuration
+docs/        Chinese reports, metrics notes, related papers, and worklog
 scripts/     Data construction, training, and evaluation scripts
-src/         Environment, tools, verifier, and agent modules
+src/         Environment, tools, verifier, prompting, and agent modules
 ```
 
-Large datasets, model weights, experiment outputs, and internal reports are intentionally excluded from this repository.
-
-### Next Step
-
-The next milestone is an executable tool-call environment:
+Large datasets, model weights, and rollout outputs are kept outside git unless explicitly documented. The local dataset/model roots used by this project are:
 
 ```text
-reset
--> propose_regions
--> crop_region
--> retrieve_evidence
--> open_evidence
--> write_claim / abstain_claim
--> finish
+/root/datasets/evidence_grounded_vlm_agentrl
+/root/models/evidence_grounded_vlm_agentrl
 ```
 
-Then we will compare the following methods under the same verifier:
+## Next Work
 
-- SFT only;
-- step-wise verifier-guided GRPO;
-- trajectory-level GRPO;
-- trajectory-level GRPO with clipped ratio;
-- trajectory-level GRPO with clipped ratio and reference KL.
+Recommended next steps:
+
+1. Split evidence metrics into `retrieved_recall`, `opened_recall`, and `cited_recall`.
+2. Build a smaller behavior patch with 85%-90% replay and positive claim-support rows as the majority.
+3. Patch remaining GoldEval caption-boundary candidates such as `001631`, `001602`, and `001887`.
+4. Run a small page-image retrieval probe using ColPali/VisRAG-style retrieval before changing the main evidence index.
+5. Consider GRPO only after `claim_supported_rate` and cited evidence do not regress on `val_gold_50`.

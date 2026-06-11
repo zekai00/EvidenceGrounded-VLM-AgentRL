@@ -92,6 +92,8 @@ def repair_truncated_retrieve_action(text: str) -> dict[str, Any] | None:
 def normalize_action_shape(action: dict[str, Any]) -> dict[str, Any]:
     """Repair common schema slips without changing the intended tool call."""
 
+    if action.get("action") == "retrieve_evidence":
+        return normalize_retrieve_shape(action)
     if action.get("action") == "write_claim":
         return normalize_claim_shape(action)
     if action.get("action") not in {"write_claims_chunk", "write_claims_batch"}:
@@ -117,6 +119,30 @@ def normalize_action_shape(action: dict[str, Any]) -> dict[str, Any]:
     repaired["claims"] = bounded_claims
     repaired["abstains"] = bounded_abstains
     return repaired if changed or repaired != action else action
+
+
+def normalize_retrieve_shape(action: dict[str, Any]) -> dict[str, Any]:
+    repaired = dict(action)
+    repaired_keys = list(repaired.get("_schema_repaired_keys") or [])
+    reasons = list(repaired.get("_schema_repair_reasons") or [])
+    if not repaired.get("scope"):
+        repaired["scope"] = infer_default_retrieval_scope(repaired)
+        if "scope" not in repaired_keys:
+            repaired_keys.append("scope")
+        reasons.append("missing retrieve_evidence.scope")
+    if repaired_keys:
+        repaired["_schema_repaired_keys"] = repaired_keys
+        repaired["_schema_repair_reasons"] = reasons
+    return repaired
+
+
+def infer_default_retrieval_scope(action: dict[str, Any]) -> str:
+    anchor = action.get("anchor")
+    if isinstance(anchor, dict) and anchor:
+        return "nearby_pages"
+    if action.get("source_file") or action.get("page") is not None or action.get("bbox"):
+        return "same_document"
+    return "corpus"
 
 
 def normalize_claim_shape(claim: dict[str, Any]) -> dict[str, Any]:

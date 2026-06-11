@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
+from pathlib import Path
 from typing import Any
 
 from .actions import bbox_iou
@@ -33,8 +35,24 @@ CORE_CLAIM_FIELDS = {
     "object_type",
 }
 
+NO_CLAIM_EVIDENCE_ROLES = {
+    "toc",
+    "bibliography",
+    "front_matter",
+    "back_matter",
+    "ocr_noise",
+    "low_value_background",
+}
+
+FIELD_ALIASES = {
+    "title": "depicted_work_title",
+}
+
 
 class EvidenceVerifier:
+    def __init__(self, evidence_index_dir: str | Path | None = None) -> None:
+        self.evidence_policy_by_id = load_evidence_policy(evidence_index_dir) if evidence_index_dir else {}
+
     def step_reward(self, task: dict[str, Any], action: dict[str, Any], result: dict[str, Any]) -> float:
         name = action.get("action")
         if result.get("error"):
@@ -215,9 +233,15 @@ class EvidenceVerifier:
                     correct_abstains += 1
                 continue
             if gold is not None and not gold.get("abstain") and evidence_overlap(gold, pred):
-                supported_count += 1
-                if field in CORE_CLAIM_FIELDS:
-                    core_supported_count += 1
+                overlap_ids = overlapping_evidence_ids(gold, pred)
+                if self._evidence_policy_supports_field(field, overlap_ids):
+                    supported_count += 1
+                    if field in CORE_CLAIM_FIELDS:
+                        core_supported_count += 1
+                else:
+                    unsupported_count += 1
+                    if field in CORE_CLAIM_FIELDS:
+                        core_unsupported_count += 1
             else:
                 unsupported_count += 1
                 if field in CORE_CLAIM_FIELDS:
@@ -257,8 +281,77 @@ class EvidenceVerifier:
             if item.get("field") == field:
                 if item.get("abstain"):
                     return False
-                return evidence_overlap(item, action)
+                if not evidence_overlap(item, action):
+                    return False
+                return self._evidence_policy_supports_field(field, overlapping_evidence_ids(item, action))
         return False
+
+    def _evidence_policy_supports_field(self, field: str, evidence_ids: set[str]) -> bool:
+        if not self.evidence_policy_by_id:
+            return True
+        checked = 0
+        for evidence_id in evidence_ids:
+            policy = self.evidence_policy_by_id.get(str(evidence_id))
+            if not policy:
+                # Overlay is intentionally partial; missing policy keeps legacy behavior.
+                return True
+            checked += 1
+            if policy_allows_claim_field(policy, field):
+                return True
+        return checked == 0
+
+
+def load_evidence_policy(index_dir: str | Path | None) -> dict[str, dict[str, Any]]:
+    if not index_dir:
+        return {}
+    path = Path(index_dir) / "corpus_chunks.jsonl"
+    if not path.exists():
+        return {}
+    policies: dict[str, dict[str, Any]] = {}
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not row.get("adjudication_status") and not row.get("adjudicated_evidence_role"):
+                continue
+            evidence_id = str(row.get("evidence_id") or "")
+            if evidence_id:
+                policies[evidence_id] = row
+    return policies
+
+
+def policy_allows_claim_field(policy: dict[str, Any], field: str) -> bool:
+    status = str(policy.get("adjudication_status") or "")
+    if status and status != "accepted_auto":
+        return False
+    role = str(policy.get("adjudicated_evidence_role") or policy.get("evidence_role") or "")
+    if role in NO_CLAIM_EVIDENCE_ROLES:
+        return False
+    if policy.get("usable_for_claim_by_adjudication") is False:
+        return False
+    allowed = policy.get("adjudicated_claim_allowed_fields") or policy.get("claim_allowed_fields") or []
+    if not allowed:
+        return False
+    return claim_field_allowed(field, allowed)
+
+
+def claim_field_allowed(field: str, allowed_fields: list[Any]) -> bool:
+    normalized = FIELD_ALIASES.get(str(field), str(field))
+    allowed = {FIELD_ALIASES.get(str(item), str(item)) for item in allowed_fields}
+    return normalized in allowed
+
+
+def evidence_policy_block_reason(policy: dict[str, Any], field: str) -> str | None:
+    if not policy.get("adjudication_status") and not policy.get("adjudicated_evidence_role"):
+        return None
+    if policy_allows_claim_field(policy, field):
+        return None
+    evidence_id = policy.get("evidence_id")
+    role = policy.get("adjudicated_evidence_role") or policy.get("evidence_role")
+    status = policy.get("adjudication_status")
+    allowed = policy.get("adjudicated_claim_allowed_fields") or policy.get("claim_allowed_fields") or []
+    return f"evidence {evidence_id} role={role} status={status} cannot support field={field}; allowed_fields={allowed}"
 
 
 def gold_evidence_ids(task: dict[str, Any]) -> set[str]:
@@ -272,11 +365,15 @@ def gold_evidence_ids(task: dict[str, Any]) -> set[str]:
 
 
 def evidence_overlap(gold: dict[str, Any], pred: dict[str, Any]) -> bool:
+    return bool(overlapping_evidence_ids(gold, pred))
+
+
+def overlapping_evidence_ids(gold: dict[str, Any], pred: dict[str, Any]) -> set[str]:
     gold_ids = {str(eid) for eid in gold.get("evidence_ids") or []}
     if not gold_ids:
         gold_ids = {str(eid) for eid in gold.get("candidate_evidence_ids") or []}
     pred_ids = {str(eid) for eid in pred.get("evidence_ids") or []}
-    return bool(gold_ids & pred_ids)
+    return gold_ids & pred_ids
 
 
 def selected_evidence_ids_from(

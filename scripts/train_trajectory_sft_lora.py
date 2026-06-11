@@ -14,7 +14,11 @@ import argparse
 import json
 import math
 import random
+import shutil
+import subprocess
 import sys
+import threading
+import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +49,13 @@ CLAIM_FIELD_SPEC = (
     "caption_text|image_scope|depicted_work_title|displayed_region|object_type|artist|dynasty|"
     "visual_elements|technique|composition|medium_dimensions|collection"
 )
+EVIDENCE_POLICY_KEYS = [
+    "clean_evidence_type",
+    "adjudicated_evidence_role",
+    "adjudication_status",
+    "adjudicated_claim_allowed_fields",
+    "usable_for_claim_by_adjudication",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,6 +132,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=5)
     parser.add_argument("--eval-every", type=int, default=0, help="0 disables interim validation loss.")
     parser.add_argument("--save-every", type=int, default=0, help="0 saves only final adapter.")
+    parser.add_argument(
+        "--gpu-monitor-interval",
+        type=float,
+        default=5.0,
+        help="Seconds between nvidia-smi samples. Set <=0 to disable GPU memory logging.",
+    )
+    parser.add_argument(
+        "--training-record",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Generate 训练记录.md with loss and GPU memory plots after training.",
+    )
+    parser.add_argument("--training-record-title", default="", help="Optional title for 训练记录.md.")
+    parser.add_argument("--training-record-notes", default="", help="Optional notes appended to 训练记录.md.")
     parser.add_argument("--system-prompt", default="")
     return parser.parse_args()
 
@@ -144,6 +169,8 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logs_path = output_dir / "train_log.jsonl"
+    gpu_monitor_path = output_dir / "gpu_memory_monitor.jsonl"
+    gpu_monitor = start_gpu_monitor(gpu_monitor_path, args.gpu_monitor_interval)
 
     train_rows_all = read_jsonl(Path(args.train_jsonl))
     val_rows_all = read_jsonl(Path(args.val_jsonl)) if args.val_jsonl else []
@@ -249,6 +276,9 @@ def main() -> int:
     adapter_dir = output_dir / "adapter"
     save_adapter(model, processor, adapter_dir)
     trainable, total = parameter_counts(model)
+    if gpu_monitor is not None:
+        gpu_monitor.stop()
+        gpu_monitor = None
     summary = {
         "created_at": now(),
         "output_dir": str(output_dir),
@@ -267,10 +297,126 @@ def main() -> int:
         "trainable_parameter_ratio": trainable / max(1, total),
         "run_config": str(output_dir / "run_config.json"),
         "train_log": str(logs_path),
+        "gpu_memory_monitor": str(gpu_monitor_path) if gpu_monitor_path.exists() else None,
+        "training_record": str(output_dir / "训练记录.md") if args.training_record else None,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.training_record:
+        generate_training_record(output_dir, args)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return 0
+
+
+class GpuMemoryMonitor:
+    def __init__(self, output_path: Path, interval: float) -> None:
+        self.output_path = output_path
+        self.interval = max(0.5, float(interval))
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="gpu-memory-monitor", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=self.interval + 2.0)
+
+    def _run(self) -> None:
+        with self.output_path.open("a", encoding="utf-8") as f:
+            while not self.stop_event.is_set():
+                record = {
+                    "time": now(),
+                    "timestamp": time.time(),
+                    "pid_alive": True,
+                    "gpus": query_nvidia_smi(),
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+                self.stop_event.wait(self.interval)
+
+
+def start_gpu_monitor(output_path: Path, interval: float) -> GpuMemoryMonitor | None:
+    if interval <= 0:
+        return None
+    if shutil.which("nvidia-smi") is None:
+        print(
+            json.dumps({"time": now(), "warning": "nvidia-smi not found; skip GPU memory monitor"}, ensure_ascii=False),
+            flush=True,
+        )
+        return None
+    monitor = GpuMemoryMonitor(output_path, interval)
+    monitor.start()
+    return monitor
+
+
+def query_nvidia_smi() -> list[dict[str, Any]]:
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,name,memory.used,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    gpus: list[dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 4:
+            continue
+        try:
+            gpus.append(
+                {
+                    "gpu_index": int(parts[0]),
+                    "name": parts[1],
+                    "memory_used_mib": int(float(parts[2])),
+                    "utilization_gpu_pct": int(float(parts[3])),
+                }
+            )
+        except ValueError:
+            continue
+    return gpus
+
+
+def generate_training_record(output_dir: Path, args: argparse.Namespace) -> None:
+    script = Path(__file__).with_name("summarize_sft_training_run.py")
+    if not script.exists():
+        print(
+            json.dumps({"time": now(), "warning": f"training record script not found: {script}"}, ensure_ascii=False),
+            flush=True,
+        )
+        return
+    notes = args.training_record_notes or (
+        f"由 `scripts/train_trajectory_sft_lora.py` 自动生成；gpu_monitor_interval={args.gpu_monitor_interval}s。"
+    )
+    cmd = [
+        sys.executable,
+        str(script),
+        "--run-dir",
+        str(output_dir),
+        "--title",
+        args.training_record_title or output_dir.name,
+        "--notes",
+        notes,
+    ]
+    proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        print(
+            json.dumps(
+                {
+                    "time": now(),
+                    "warning": "failed to generate training record",
+                    "returncode": proc.returncode,
+                    "stderr": proc.stderr[-1000:],
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    elif proc.stdout.strip():
+        print(proc.stdout.strip(), flush=True)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -426,21 +572,27 @@ def build_compact_prompt_text(row: dict[str, Any], args: argparse.Namespace) -> 
     tool_results = [simplify_tool_result(item, args) for item in (row.get("tool_results") or [])[-args.max_tool_results :]]
     draft_claims = row.get("draft_claims") or []
     images = row.get("images") or []
+    no_select = is_no_select_row(row)
     v0_7 = is_inspect_crop_row(row)
     if v0_7:
-        target_line = "目标：先检查 PDF 页面布局，再裁剪目标山水画图像，之后检索证据并写出有证据支撑的结构化 claim。"
+        target_line = (
+            "目标：先检查 PDF 页面布局，再裁剪目标山水画图像，之后直接打开/检索可见证据并写出有证据支撑的结构化 claim；本协议不使用 select_evidence。"
+            if no_select
+            else "目标：先检查 PDF 页面布局，再裁剪目标山水画图像，之后检索证据并写出有证据支撑的结构化 claim。"
+        )
         tool_lines = [
             '1. {"action":"inspect_page","top_k":整数}',
             '2. {"action":"crop_target","region_id":"r_xxx"} 或 {"action":"crop_target","bbox":[x1,y1,x2,y2]}',
             '3. {"action":"retrieve_evidence","query":"...","scope":"current_page|nearby_pages|same_document|corpus","anchor":{"source_file":"...","page":页码,"bbox":[x1,y1,x2,y2]},"top_k":整数}',
             '4. {"action":"open_evidence","evidence_id":"ev_xxx"}',
-            '5. {"action":"select_evidence","evidence_ids":["ev_xxx或local_caption_xxx"]}',
             f'6. {{"action":"write_claims_chunk","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
             f'7. {{"action":"write_claim","field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}',
             '8. {"action":"abstain_claim","field":"字段名","reason":"证据不足原因"}',
             f'9. {{"action":"write_claims_batch","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
             '10. {"action":"finish","status":"done"}',
         ]
+        if not no_select:
+            tool_lines.insert(4, '5. {"action":"select_evidence","evidence_ids":["ev_xxx或local_caption_xxx"]}')
         coordinate_rule = (
             "坐标规则：inspect_page 会返回 layout regions；region bbox 和 crop_target 的 bbox 都使用第 1 张 PDF 原始页面图像的像素坐标，"
             "原点在左上角，格式为 [x1,y1,x2,y2]；先 inspect_page，再 crop_target。"
@@ -475,6 +627,7 @@ def build_compact_prompt_text(row: dict[str, Any], args: argparse.Namespace) -> 
         "可用工具：",
         *tool_lines,
         "约束：只输出一个 JSON 对象；不要输出 markdown；不要编造作品名、画家、朝代、技法；证据不足就 abstain。",
+        "证据边界约束：如果证据摘要包含 adjudicated_claim_allowed_fields，只能用该 evidence 支持这些字段；如果 usable_for_claim_by_adjudication=false 或 adjudication_status 不是 accepted_auto，应对该字段 abstain 或继续检索。",
         "Claim 写入约束：write_claims_chunk 每次最多写入或 abstain 1 个 remaining_fields 中的字段；remaining_fields 非空时禁止 finish。",
         "历史动作（保留最近若干步）：",
         json.dumps(history, ensure_ascii=False, separators=(",", ":")),
@@ -517,6 +670,18 @@ def is_inspect_crop_row(row: dict[str, Any]) -> bool:
     actions = [row.get("action") if isinstance(row.get("action"), dict) else {}]
     actions.extend(item for item in row.get("history") or [] if isinstance(item, dict))
     return any(str(item.get("action")) in {"inspect_page", "crop_target"} for item in actions)
+
+
+def is_no_select_row(row: dict[str, Any]) -> bool:
+    version = str(row.get("tool_schema_version") or "")
+    if "no_select" in version:
+        return True
+    phase_name = str(row.get("phase_name") or "")
+    if "no_select" in phase_name:
+        return True
+    actions = [str((row.get("action") or {}).get("action", ""))]
+    actions.extend(str(item.get("action", "")) for item in row.get("history") or [] if isinstance(item, dict))
+    return "select_evidence" not in actions and any(action in {"inspect_page", "crop_target"} for action in actions)
 
 
 def is_crop_only_region_selection_row(row: dict[str, Any]) -> bool:
@@ -612,6 +777,9 @@ def simplify_tool_result(result: Any, args: argparse.Namespace) -> Any:
         for key in ["source_file", "page_start", "page_end", "authority_level", "citation_level", "source_quality"]:
             if key in result:
                 simplified[key] = result.get(key)
+        for key in EVIDENCE_POLICY_KEYS:
+            if key in result and result.get(key) is not None:
+                simplified[key] = result.get(key)
         for key in ["display_snippet", "evidence_summary", "text", "raw_chunk_text"]:
             if key in result and result.get(key):
                 simplified[key] = truncate_text(str(result.get(key)), args.snippet_chars)
@@ -639,7 +807,7 @@ def simplify_evidence(item: Any, args: argparse.Namespace) -> Any:
     if not isinstance(item, dict):
         return item
     snippet = item.get("evidence_summary") or item.get("display_snippet") or item.get("text") or ""
-    return {
+    simplified = {
         "evidence_id": item.get("evidence_id"),
         "source_file": item.get("source_file"),
         "page_start": item.get("page_start"),
@@ -649,6 +817,10 @@ def simplify_evidence(item: Any, args: argparse.Namespace) -> Any:
         "score": item.get("score"),
         "snippet": truncate_text(str(snippet), args.snippet_chars),
     }
+    for key in EVIDENCE_POLICY_KEYS:
+        if key in item and item.get(key) is not None:
+            simplified[key] = item.get(key)
+    return simplified
 
 
 def truncate_text(text: str, max_chars: int) -> str:

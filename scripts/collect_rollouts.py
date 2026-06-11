@@ -104,6 +104,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated fields required before finish is allowed. Empty means the default 12-field claim card.",
     )
+    parser.add_argument(
+        "--target-claim-fields-from-gold",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When --target-claim-fields is empty, read the required fields from selected tasks' gold target_claim_fields/claim_schema_fields.",
+    )
     parser.add_argument("--system-prompt", default="")
     parser.add_argument("--print-steps", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -117,6 +123,7 @@ def main() -> int:
 
     task_rows = read_jsonl(args.tasks)
     selected = select_tasks(task_rows, args)
+    target_claim_fields = resolve_target_claim_fields(args, selected)
     prompt_config = PromptConfig(
         max_history_actions=args.max_history_actions,
         max_tool_results=args.max_tool_results,
@@ -155,7 +162,7 @@ def main() -> int:
         phase_aware_mask=args.phase_aware_mask,
         enforce_tool_mask=args.enforce_tool_mask,
         tool_schema=args.tool_schema,
-        target_claim_fields=parse_target_claim_fields(args.target_claim_fields),
+        target_claim_fields=target_claim_fields,
     )
 
     rollout_records: list[dict[str, Any]] = []
@@ -167,7 +174,7 @@ def main() -> int:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
             print(json.dumps(progress_record(ordinal + 1, len(selected), rollout_records), ensure_ascii=False), flush=True)
 
-    summary = build_summary(args, policy, rollout_records, trajectories_path)
+    summary = build_summary(args, policy, rollout_records, trajectories_path, target_claim_fields)
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     write_markdown_report(output_dir / "rollout_report.md", summary, rollout_records)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
@@ -189,6 +196,43 @@ def select_tasks(tasks: list[dict[str, Any]], args: argparse.Namespace) -> list[
 def parse_target_claim_fields(value: str) -> list[str] | None:
     fields = [item.strip() for item in str(value or "").split(",") if item.strip()]
     return fields or None
+
+
+def resolve_target_claim_fields(args: argparse.Namespace, selected: list[dict[str, Any]]) -> list[str] | None:
+    explicit_fields = parse_target_claim_fields(args.target_claim_fields)
+    if explicit_fields:
+        return explicit_fields
+    if not args.target_claim_fields_from_gold:
+        return None
+
+    field_sets: list[tuple[str, ...]] = []
+    missing_task_ids: list[str] = []
+    for task in selected:
+        fields = task_gold_target_claim_fields(task)
+        if fields:
+            field_sets.append(tuple(fields))
+        else:
+            missing_task_ids.append(str(task.get("task_id")))
+    if missing_task_ids:
+        raise ValueError(f"selected tasks are missing gold target claim fields: {missing_task_ids[:10]}")
+    unique_field_sets = sorted(set(field_sets))
+    if not unique_field_sets:
+        raise ValueError("selected tasks do not contain gold target claim fields")
+    if len(unique_field_sets) != 1:
+        raise ValueError(f"selected tasks contain inconsistent gold target claim fields: {unique_field_sets}")
+    return list(unique_field_sets[0])
+
+
+def task_gold_target_claim_fields(task: dict[str, Any]) -> list[str]:
+    gold = task.get("gold") or {}
+    raw_fields = (
+        gold.get("target_claim_fields")
+        or gold.get("claim_schema_fields")
+        or task.get("target_claim_fields")
+        or task.get("claim_schema_fields")
+        or []
+    )
+    return [str(item) for item in raw_fields if str(item)]
 
 
 def run_one(
@@ -264,6 +308,7 @@ def run_one(
         "trajectory": str(trajectory_path),
         "metrics": {
             **summarize_one(steps, env.draft_claims, env.trajectory_metrics()),
+            **process_diagnostics(task, steps),
             **region_diagnostics(task, steps),
         },
     }
@@ -279,6 +324,10 @@ def summarize_one(
         for step in steps
     )
     mask_violations = sum(int(step.get("mask_violation", False)) for step in steps)
+    schema_repair_steps = [step for step in steps if schema_repaired_keys(step)]
+    schema_repair_key_counts: Counter[str] = Counter()
+    for step in schema_repair_steps:
+        schema_repair_key_counts.update(schema_repaired_keys(step))
     crop_ious = [
         float((step.get("result") or {}).get("bbox_iou"))
         for step in steps
@@ -308,6 +357,9 @@ def summarize_one(
         "premature_finish_rate": float(trajectory_metrics.get("premature_finish_rate", 0.0) or 0.0),
         "mask_violation_count": mask_violations,
         "mask_violation_rate": mask_violations / max(1, len(steps)),
+        "schema_repair_count": len(schema_repair_steps),
+        "schema_repair_rate": len(schema_repair_steps) / max(1, len(steps)),
+        "schema_repaired_key_counts": dict(schema_repair_key_counts),
         "trajectory_success": bool(trajectory_metrics.get("trajectory_success")),
         "final_reward": trajectory_metrics.get("final_reward"),
         "claim_supported_rate": trajectory_metrics.get("claim_supported_rate"),
@@ -317,6 +369,87 @@ def summarize_one(
         "core_supported_rate": trajectory_metrics.get("core_supported_rate"),
         "core_field_match_count": trajectory_metrics.get("core_field_match_count"),
         "core_field_recall": trajectory_metrics.get("core_field_recall"),
+    }
+
+
+def schema_repaired_keys(step: dict[str, Any]) -> list[str]:
+    action = step.get("parsed_action") or {}
+    result = step.get("result") or {}
+    keys: list[str] = []
+    for source in [action, result]:
+        if not isinstance(source, dict):
+            continue
+        for key in source.get("_schema_repaired_keys") or source.get("schema_repaired_keys") or []:
+            key = str(key)
+            if key and key not in keys:
+                keys.append(key)
+    return keys
+
+
+def process_diagnostics(task: dict[str, Any], steps: list[dict[str, Any]]) -> dict[str, Any]:
+    local_evidence_ids = {str(item.get("evidence_id")) for item in task.get("local_evidence") or []}
+    retrieve_steps: list[int] = []
+    write_steps: list[int] = []
+    open_steps: list[int] = []
+    local_open_steps: list[int] = []
+    external_open_steps: list[int] = []
+    negative_retrieve_count = 0
+    negative_write_claim_count = 0
+    finish_not_ready_count = 0
+    premature_mask_finish = False
+    claim_continuation_finish_count = 0
+
+    for index, step in enumerate(steps):
+        action = step.get("parsed_action") or {}
+        action_name = str(action.get("action", "invalid")) if isinstance(action, dict) else "invalid"
+        phase = str((step.get("tool_mask") or {}).get("phase") or "")
+        reward = step.get("reward")
+        if action_name == "retrieve_evidence":
+            retrieve_steps.append(index)
+            if isinstance(reward, (int, float)) and float(reward) < 0:
+                negative_retrieve_count += 1
+        if action_name in {"write_claim", "write_claims_chunk", "write_claims_batch", "abstain_claim"}:
+            write_steps.append(index)
+            if isinstance(reward, (int, float)) and float(reward) < 0:
+                negative_write_claim_count += 1
+        if action_name == "open_evidence":
+            open_steps.append(index)
+            evidence_id = str(action.get("evidence_id") or "")
+            if evidence_id in local_evidence_ids or evidence_id.startswith("local_"):
+                local_open_steps.append(index)
+            else:
+                external_open_steps.append(index)
+        if action_name == "finish":
+            if phase != "finish_ready":
+                finish_not_ready_count += 1
+            if phase == "claim_continuation":
+                claim_continuation_finish_count += 1
+            if step.get("mask_violation") or (step.get("result") or {}).get("error"):
+                premature_mask_finish = True
+
+    first_retrieve_step = min(retrieve_steps) if retrieve_steps else None
+    first_write_step = min(write_steps) if write_steps else None
+    external_after_retrieve = [
+        step_index
+        for step_index in external_open_steps
+        if first_retrieve_step is not None and step_index > first_retrieve_step
+    ]
+    return {
+        "retrieve_count": len(retrieve_steps),
+        "open_evidence_count": len(open_steps),
+        "local_open_count": len(local_open_steps),
+        "external_open_count": len(external_open_steps),
+        "external_open_after_retrieve_count": len(external_after_retrieve),
+        "no_retrieve": len(retrieve_steps) == 0,
+        "retrieve_without_external_open": bool(retrieve_steps) and not external_after_retrieve,
+        "write_before_retrieve": bool(write_steps) and (first_retrieve_step is None or first_write_step < first_retrieve_step),
+        "first_retrieve_step": first_retrieve_step,
+        "first_write_step": first_write_step,
+        "premature_mask_finish": premature_mask_finish,
+        "finish_not_ready_count": finish_not_ready_count,
+        "claim_continuation_finish_count": claim_continuation_finish_count,
+        "negative_retrieve_count": negative_retrieve_count,
+        "negative_write_claim_count": negative_write_claim_count,
     }
 
 
@@ -384,13 +517,16 @@ def build_summary(
     policy: QwenVLSftPolicy,
     records: list[dict[str, Any]],
     trajectories_path: Path,
+    target_claim_fields: list[str] | None,
 ) -> dict[str, Any]:
     n = max(1, len(records))
     action_counts: Counter[str] = Counter()
+    schema_repair_key_counts: Counter[str] = Counter()
     for record in records:
         for step in record.get("steps") or []:
             action = step.get("parsed_action") or {}
             action_counts[str(action.get("action", "invalid")) if isinstance(action, dict) else "invalid"] += 1
+            schema_repair_key_counts.update(schema_repaired_keys(step))
     candidate_ious = [
         float(item.get("metrics", {}).get("candidate_oracle_iou"))
         for item in records
@@ -412,7 +548,8 @@ def build_summary(
             "include_gold_regions": args.include_gold_regions,
             "phase_aware_mask": args.phase_aware_mask,
             "enforce_tool_mask": args.enforce_tool_mask,
-            "target_claim_fields": parse_target_claim_fields(args.target_claim_fields),
+            "target_claim_fields": target_claim_fields,
+            "target_claim_fields_from_gold": bool(args.target_claim_fields_from_gold),
         },
         "policy": policy.metadata(),
         "metrics": {
@@ -468,6 +605,40 @@ def build_summary(
             "mean_invalid_step_rate": sum(float(item.get("trajectory_metrics", {}).get("invalid_step_rate", 0.0)) for item in records) / n,
             "mean_mask_violation_rate": sum(float(item.get("metrics", {}).get("mask_violation_rate", 0.0)) for item in records) / n,
             "mask_violation_task_rate": sum(int(item.get("metrics", {}).get("mask_violation_count", 0) > 0) for item in records) / n,
+            "mean_schema_repair_rate": sum(float(item.get("metrics", {}).get("schema_repair_rate", 0.0)) for item in records) / n,
+            "schema_repair_task_rate": sum(int(item.get("metrics", {}).get("schema_repair_count", 0) > 0) for item in records) / n,
+            "schema_repaired_key_counts": dict(schema_repair_key_counts),
+            "no_retrieve_task_rate": sum(int(bool(item.get("metrics", {}).get("no_retrieve"))) for item in records) / n,
+            "retrieve_without_external_open_task_rate": sum(
+                int(bool(item.get("metrics", {}).get("retrieve_without_external_open"))) for item in records
+            )
+            / n,
+            "write_before_retrieve_task_rate": sum(
+                int(bool(item.get("metrics", {}).get("write_before_retrieve"))) for item in records
+            )
+            / n,
+            "premature_mask_finish_task_rate": sum(
+                int(bool(item.get("metrics", {}).get("premature_mask_finish"))) for item in records
+            )
+            / n,
+            "finish_not_ready_task_rate": sum(
+                int(int(item.get("metrics", {}).get("finish_not_ready_count", 0) or 0) > 0) for item in records
+            )
+            / n,
+            "mean_retrieve_count": sum(int(item.get("metrics", {}).get("retrieve_count", 0) or 0) for item in records) / n,
+            "mean_external_open_count": sum(int(item.get("metrics", {}).get("external_open_count", 0) or 0) for item in records) / n,
+            "mean_external_open_after_retrieve_count": sum(
+                int(item.get("metrics", {}).get("external_open_after_retrieve_count", 0) or 0) for item in records
+            )
+            / n,
+            "mean_negative_retrieve_count": sum(
+                int(item.get("metrics", {}).get("negative_retrieve_count", 0) or 0) for item in records
+            )
+            / n,
+            "mean_negative_write_claim_count": sum(
+                int(item.get("metrics", {}).get("negative_write_claim_count", 0) or 0) for item in records
+            )
+            / n,
             "action_counts": dict(action_counts),
         },
         "rollouts": str(trajectories_path),
@@ -507,6 +678,8 @@ def write_markdown_report(path: Path, summary: dict[str, Any], records: list[dic
         f"- adapter: {summary['policy']['adapter']}",
         f"- runtime tasks: {summary['tasks_path']}",
         f"- phase_aware_mask: {summary.get('env', {}).get('phase_aware_mask')}; enforce_tool_mask: {summary.get('env', {}).get('enforce_tool_mask')}",
+        f"- target_claim_fields: `{json.dumps(summary.get('env', {}).get('target_claim_fields'), ensure_ascii=False)}`",
+        f"- target_claim_fields_from_gold: {summary.get('env', {}).get('target_claim_fields_from_gold')}",
         "",
         "## Metrics",
         "",
@@ -534,6 +707,19 @@ def write_markdown_report(path: Path, summary: dict[str, Any], records: list[dic
         f"- mean_invalid_step_rate: {metrics['mean_invalid_step_rate']:.3f}",
         f"- mean_mask_violation_rate: {metrics.get('mean_mask_violation_rate', 0.0):.3f}",
         f"- mask_violation_task_rate: {metrics.get('mask_violation_task_rate', 0.0):.3f}",
+        f"- mean_schema_repair_rate: {metrics.get('mean_schema_repair_rate', 0.0):.3f}",
+        f"- schema_repair_task_rate: {metrics.get('schema_repair_task_rate', 0.0):.3f}",
+        f"- schema_repaired_key_counts: `{json.dumps(metrics.get('schema_repaired_key_counts', {}), ensure_ascii=False)}`",
+        f"- no_retrieve_task_rate: {metrics.get('no_retrieve_task_rate', 0.0):.3f}",
+        f"- retrieve_without_external_open_task_rate: {metrics.get('retrieve_without_external_open_task_rate', 0.0):.3f}",
+        f"- write_before_retrieve_task_rate: {metrics.get('write_before_retrieve_task_rate', 0.0):.3f}",
+        f"- premature_mask_finish_task_rate: {metrics.get('premature_mask_finish_task_rate', 0.0):.3f}",
+        f"- finish_not_ready_task_rate: {metrics.get('finish_not_ready_task_rate', 0.0):.3f}",
+        f"- mean_retrieve_count: {metrics.get('mean_retrieve_count', 0.0):.3f}",
+        f"- mean_external_open_count: {metrics.get('mean_external_open_count', 0.0):.3f}",
+        f"- mean_external_open_after_retrieve_count: {metrics.get('mean_external_open_after_retrieve_count', 0.0):.3f}",
+        f"- mean_negative_retrieve_count: {metrics.get('mean_negative_retrieve_count', 0.0):.3f}",
+        f"- mean_negative_write_claim_count: {metrics.get('mean_negative_write_claim_count', 0.0):.3f}",
         f"- mean_steps: {metrics['mean_steps']:.2f}",
         f"- mean_claim_count: {metrics['mean_claim_count']:.2f}",
         f"- action_counts: `{json.dumps(metrics['action_counts'], ensure_ascii=False)}`",
@@ -554,6 +740,9 @@ def write_markdown_report(path: Path, summary: dict[str, Any], records: list[dic
                 f"- evidence_hit_count: {metrics_one.get('evidence_hit_count')}; claim_count: {metrics_one.get('claim_count')}; has_finish_action: {metrics_one.get('has_finish_action')}; has_finish: {metrics_one.get('has_finish')}; premature_finish_count: {metrics_one.get('premature_finish_count')}",
                 f"- trajectory_success: {metrics_one.get('trajectory_success')}; final_reward: {metrics_one.get('final_reward')}; claim_supported_rate: {metrics_one.get('claim_supported_rate')}; evidence_recall: {metrics_one.get('evidence_recall')}",
                 f"- mask_violation_count: {metrics_one.get('mask_violation_count')}; mask_violation_rate: {metrics_one.get('mask_violation_rate')}",
+                f"- schema_repair_count: {metrics_one.get('schema_repair_count')}; schema_repair_rate: {metrics_one.get('schema_repair_rate')}; schema_repaired_key_counts: `{json.dumps(metrics_one.get('schema_repaired_key_counts', {}), ensure_ascii=False)}`",
+                f"- process: no_retrieve={metrics_one.get('no_retrieve')}; retrieve_without_external_open={metrics_one.get('retrieve_without_external_open')}; write_before_retrieve={metrics_one.get('write_before_retrieve')}; premature_mask_finish={metrics_one.get('premature_mask_finish')}",
+                f"- process counts: retrieve={metrics_one.get('retrieve_count')}; external_open={metrics_one.get('external_open_count')}; external_open_after_retrieve={metrics_one.get('external_open_after_retrieve_count')}; negative_retrieve={metrics_one.get('negative_retrieve_count')}; negative_write_claim={metrics_one.get('negative_write_claim_count')}",
                 f"- trajectory: `{record.get('trajectory')}`",
                 "",
             ]

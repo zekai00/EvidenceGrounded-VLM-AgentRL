@@ -20,7 +20,7 @@ from .tools.claim_tools import (
 )
 from .tools.region_proposal import propose_regions
 from .tool_mask import action_allowed, phase_aware_tool_mask, schema_actions
-from .verifier import EvidenceVerifier, gold_evidence_ids
+from .verifier import EvidenceVerifier, evidence_policy_block_reason, gold_evidence_ids
 
 
 class EvidenceAgentEnv:
@@ -48,7 +48,7 @@ class EvidenceAgentEnv:
         self.target_claim_fields = list(target_claim_fields or DEFAULT_CLAIM_FIELDS)
         self.tasks = read_jsonl(self.tasks_path)
         self.index: EvidenceIndex | None = None
-        self.verifier = EvidenceVerifier()
+        self.verifier = EvidenceVerifier(self.evidence_index_dir)
         self.task: dict[str, Any] | None = None
         self.history: list[dict[str, Any]] = []
         self.tool_results: list[dict[str, Any]] = []
@@ -231,6 +231,8 @@ class EvidenceAgentEnv:
                 "query": action.get("query"),
                 "scope": action.get("scope"),
                 "anchor": action.get("anchor"),
+                "schema_repaired_keys": action.get("_schema_repaired_keys") or [],
+                "schema_repair_reasons": action.get("_schema_repair_reasons") or [],
                 "results": results,
                 "hit_evidence_ids": hit_ids,
             }
@@ -251,6 +253,10 @@ class EvidenceAgentEnv:
                 "page_end": item.get("page_end"),
                 "authority_level": item.get("authority_level"),
                 "citation_level": item.get("citation_level"),
+                "adjudicated_evidence_role": item.get("adjudicated_evidence_role"),
+                "adjudication_status": item.get("adjudication_status"),
+                "adjudicated_claim_allowed_fields": item.get("adjudicated_claim_allowed_fields"),
+                "usable_for_claim_by_adjudication": item.get("usable_for_claim_by_adjudication"),
                 "display_snippet": item.get("display_snippet") or item.get("evidence_summary") or item.get("text", "")[:600],
             }
         if name == "write_claim":
@@ -372,6 +378,10 @@ class EvidenceAgentEnv:
             "authority_level": item.get("authority_level"),
             "citation_level": item.get("citation_level"),
             "source_quality": item.get("source_quality"),
+            "adjudicated_evidence_role": item.get("adjudicated_evidence_role"),
+            "adjudication_status": item.get("adjudication_status"),
+            "adjudicated_claim_allowed_fields": item.get("adjudicated_claim_allowed_fields"),
+            "usable_for_claim_by_adjudication": item.get("usable_for_claim_by_adjudication"),
             "display_snippet": item.get("display_snippet") or item.get("evidence_summary") or item.get("text", ""),
         }
 
@@ -587,9 +597,11 @@ class EvidenceAgentEnv:
         visible_ids = set(self._visible_evidence_items())
         unknown: list[str] = []
         empty_fields: list[str] = []
+        visible = self._visible_evidence_items()
         for claim in claims:
             if not isinstance(claim, dict):
                 continue
+            field = str(claim.get("field") or "")
             evidence_ids = [str(item) for item in (claim.get("evidence_ids") or [])]
             if not evidence_ids:
                 empty_fields.append(str(claim.get("field", "")))
@@ -597,6 +609,10 @@ class EvidenceAgentEnv:
             for evidence_id in evidence_ids:
                 if evidence_id not in visible_ids:
                     unknown.append(evidence_id)
+                    continue
+                block_reason = evidence_policy_block_reason(visible.get(evidence_id) or {}, field)
+                if block_reason:
+                    return block_reason
         if empty_fields:
             return f"claim evidence_ids must be non-empty for fields: {empty_fields}"
         if unknown:
