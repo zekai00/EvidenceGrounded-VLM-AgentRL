@@ -364,6 +364,15 @@ def summarize_one(
         "final_reward": trajectory_metrics.get("final_reward"),
         "claim_supported_rate": trajectory_metrics.get("claim_supported_rate"),
         "evidence_recall": trajectory_metrics.get("evidence_recall"),
+        "retrieved_evidence_recall": trajectory_metrics.get("retrieved_evidence_recall"),
+        "opened_evidence_recall": trajectory_metrics.get("opened_evidence_recall"),
+        "cited_evidence_recall": trajectory_metrics.get("cited_evidence_recall"),
+        "retrieved_evidence_count": trajectory_metrics.get("retrieved_evidence_count"),
+        "opened_evidence_count": trajectory_metrics.get("opened_evidence_count"),
+        "cited_evidence_count": trajectory_metrics.get("cited_evidence_count"),
+        "retrieved_evidence_hit_count": trajectory_metrics.get("retrieved_evidence_hit_count"),
+        "opened_evidence_hit_count": trajectory_metrics.get("opened_evidence_hit_count"),
+        "cited_evidence_hit_count": trajectory_metrics.get("cited_evidence_hit_count"),
         "invalid_step_rate": trajectory_metrics.get("invalid_step_rate"),
         "core_supported_count": trajectory_metrics.get("core_supported_count"),
         "core_supported_rate": trajectory_metrics.get("core_supported_rate"),
@@ -602,6 +611,42 @@ def build_summary(
             "mean_final_reward": sum(float(item.get("trajectory_metrics", {}).get("final_reward", 0.0)) for item in records) / n,
             "mean_claim_supported_rate": sum(float(item.get("trajectory_metrics", {}).get("claim_supported_rate", 0.0)) for item in records) / n,
             "mean_evidence_recall": sum(float(item.get("trajectory_metrics", {}).get("evidence_recall", 0.0)) for item in records) / n,
+            "mean_retrieved_evidence_recall": sum(
+                float(item.get("trajectory_metrics", {}).get("retrieved_evidence_recall", 0.0)) for item in records
+            )
+            / n,
+            "mean_opened_evidence_recall": sum(
+                float(item.get("trajectory_metrics", {}).get("opened_evidence_recall", 0.0)) for item in records
+            )
+            / n,
+            "mean_cited_evidence_recall": sum(
+                float(item.get("trajectory_metrics", {}).get("cited_evidence_recall", 0.0)) for item in records
+            )
+            / n,
+            "mean_retrieved_evidence_count": sum(
+                int(item.get("trajectory_metrics", {}).get("retrieved_evidence_count", 0) or 0) for item in records
+            )
+            / n,
+            "mean_opened_evidence_count": sum(
+                int(item.get("trajectory_metrics", {}).get("opened_evidence_count", 0) or 0) for item in records
+            )
+            / n,
+            "mean_cited_evidence_count": sum(
+                int(item.get("trajectory_metrics", {}).get("cited_evidence_count", 0) or 0) for item in records
+            )
+            / n,
+            "mean_retrieved_evidence_hit_count": sum(
+                int(item.get("trajectory_metrics", {}).get("retrieved_evidence_hit_count", 0) or 0) for item in records
+            )
+            / n,
+            "mean_opened_evidence_hit_count": sum(
+                int(item.get("trajectory_metrics", {}).get("opened_evidence_hit_count", 0) or 0) for item in records
+            )
+            / n,
+            "mean_cited_evidence_hit_count": sum(
+                int(item.get("trajectory_metrics", {}).get("cited_evidence_hit_count", 0) or 0) for item in records
+            )
+            / n,
             "mean_invalid_step_rate": sum(float(item.get("trajectory_metrics", {}).get("invalid_step_rate", 0.0)) for item in records) / n,
             "mean_mask_violation_rate": sum(float(item.get("metrics", {}).get("mask_violation_rate", 0.0)) for item in records) / n,
             "mask_violation_task_rate": sum(int(item.get("metrics", {}).get("mask_violation_count", 0) > 0) for item in records) / n,
@@ -704,6 +749,15 @@ def write_markdown_report(path: Path, summary: dict[str, Any], records: list[dic
         f"- mean_final_reward: {metrics['mean_final_reward']:.3f}",
         f"- mean_claim_supported_rate: {metrics['mean_claim_supported_rate']:.3f}",
         f"- mean_evidence_recall: {metrics['mean_evidence_recall']:.3f}",
+        f"- mean_retrieved_evidence_recall: {metrics.get('mean_retrieved_evidence_recall', 0.0):.3f}",
+        f"- mean_opened_evidence_recall: {metrics.get('mean_opened_evidence_recall', 0.0):.3f}",
+        f"- mean_cited_evidence_recall: {metrics.get('mean_cited_evidence_recall', 0.0):.3f}",
+        f"- mean_retrieved_evidence_count: {metrics.get('mean_retrieved_evidence_count', 0.0):.3f}",
+        f"- mean_opened_evidence_count: {metrics.get('mean_opened_evidence_count', 0.0):.3f}",
+        f"- mean_cited_evidence_count: {metrics.get('mean_cited_evidence_count', 0.0):.3f}",
+        f"- mean_retrieved_evidence_hit_count: {metrics.get('mean_retrieved_evidence_hit_count', 0.0):.3f}",
+        f"- mean_opened_evidence_hit_count: {metrics.get('mean_opened_evidence_hit_count', 0.0):.3f}",
+        f"- mean_cited_evidence_hit_count: {metrics.get('mean_cited_evidence_hit_count', 0.0):.3f}",
         f"- mean_invalid_step_rate: {metrics['mean_invalid_step_rate']:.3f}",
         f"- mean_mask_violation_rate: {metrics.get('mean_mask_violation_rate', 0.0):.3f}",
         f"- mask_violation_task_rate: {metrics.get('mask_violation_task_rate', 0.0):.3f}",
@@ -739,6 +793,7 @@ def write_markdown_report(path: Path, summary: dict[str, Any], records: list[dic
                 f"- candidate_oracle_iou: {metrics_one.get('candidate_oracle_iou')}; candidate_oracle_rank: {metrics_one.get('candidate_oracle_rank')}; crop_region_called: {metrics_one.get('crop_region_called')}; selected_region_iou: {metrics_one.get('selected_region_iou')}; selected_region_id: {metrics_one.get('selected_region_id')}",
                 f"- evidence_hit_count: {metrics_one.get('evidence_hit_count')}; claim_count: {metrics_one.get('claim_count')}; has_finish_action: {metrics_one.get('has_finish_action')}; has_finish: {metrics_one.get('has_finish')}; premature_finish_count: {metrics_one.get('premature_finish_count')}",
                 f"- trajectory_success: {metrics_one.get('trajectory_success')}; final_reward: {metrics_one.get('final_reward')}; claim_supported_rate: {metrics_one.get('claim_supported_rate')}; evidence_recall: {metrics_one.get('evidence_recall')}",
+                f"- evidence flow: retrieved_recall={metrics_one.get('retrieved_evidence_recall')}; opened_recall={metrics_one.get('opened_evidence_recall')}; cited_recall={metrics_one.get('cited_evidence_recall')}; retrieved_hits={metrics_one.get('retrieved_evidence_hit_count')}; opened_hits={metrics_one.get('opened_evidence_hit_count')}; cited_hits={metrics_one.get('cited_evidence_hit_count')}",
                 f"- mask_violation_count: {metrics_one.get('mask_violation_count')}; mask_violation_rate: {metrics_one.get('mask_violation_rate')}",
                 f"- schema_repair_count: {metrics_one.get('schema_repair_count')}; schema_repair_rate: {metrics_one.get('schema_repair_rate')}; schema_repaired_key_counts: `{json.dumps(metrics_one.get('schema_repaired_key_counts', {}), ensure_ascii=False)}`",
                 f"- process: no_retrieve={metrics_one.get('no_retrieve')}; retrieve_without_external_open={metrics_one.get('retrieve_without_external_open')}; write_before_retrieve={metrics_one.get('write_before_retrieve')}; premature_mask_finish={metrics_one.get('premature_mask_finish')}",

@@ -50,6 +50,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-replay-rows", type=int, default=1400)
     parser.add_argument("--max-boundary-train", type=int, default=120)
     parser.add_argument("--max-boundary-val", type=int, default=32)
+    parser.add_argument("--max-supported-train", type=int, default=0)
+    parser.add_argument("--max-abstain-train", type=int, default=0)
+    parser.add_argument("--max-finish-train", type=int, default=0)
+    parser.add_argument("--max-supported-val", type=int, default=0)
+    parser.add_argument("--max-abstain-val", type=int, default=0)
+    parser.add_argument("--max-finish-val", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -100,15 +106,27 @@ def main() -> int:
         limit=args.max_boundary_val,
     )
 
-    patch_train = balanced_sample(
-        continuation_train + finish_train + boundary_train,
-        args.max_patch_train,
-        rng,
+    patch_train = build_patch_mix(
+        continuation_rows=continuation_train,
+        finish_rows=finish_train,
+        boundary_rows=boundary_train,
+        max_total=args.max_patch_train,
+        supported_limit=args.max_supported_train,
+        abstain_limit=args.max_abstain_train,
+        boundary_limit=args.max_boundary_train,
+        finish_limit=args.max_finish_train,
+        rng=rng,
     )
-    patch_val = balanced_sample(
-        continuation_val + finish_val + boundary_val,
-        args.max_patch_val,
-        rng,
+    patch_val = build_patch_mix(
+        continuation_rows=continuation_val,
+        finish_rows=finish_val,
+        boundary_rows=boundary_val,
+        max_total=args.max_patch_val,
+        supported_limit=args.max_supported_val,
+        abstain_limit=args.max_abstain_val,
+        boundary_limit=args.max_boundary_val,
+        finish_limit=args.max_finish_val,
+        rng=rng,
     )
     replay_rows = collect_replay_rows(
         sft_rows_by_split.get("train", []),
@@ -143,6 +161,17 @@ def main() -> int:
                 "disallowed_evidence_field_pair_abstains",
             ],
             "replay_ratio": args.replay_ratio,
+            "quota_sampling_enabled": quota_sampling_enabled(args),
+            "quotas": {
+                "max_supported_train": args.max_supported_train,
+                "max_abstain_train": args.max_abstain_train,
+                "max_boundary_train": args.max_boundary_train,
+                "max_finish_train": args.max_finish_train,
+                "max_supported_val": args.max_supported_val,
+                "max_abstain_val": args.max_abstain_val,
+                "max_boundary_val": args.max_boundary_val,
+                "max_finish_val": args.max_finish_val,
+            },
         },
         "candidate_counts": {
             "continuation_train": len(continuation_train),
@@ -449,6 +478,61 @@ def collect_replay_rows(
     return selected
 
 
+def quota_sampling_enabled(args: argparse.Namespace) -> bool:
+    return any(
+        int(getattr(args, key, 0) or 0) > 0
+        for key in [
+            "max_supported_train",
+            "max_abstain_train",
+            "max_finish_train",
+            "max_supported_val",
+            "max_abstain_val",
+            "max_finish_val",
+        ]
+    )
+
+
+def build_patch_mix(
+    *,
+    continuation_rows: list[dict[str, Any]],
+    finish_rows: list[dict[str, Any]],
+    boundary_rows: list[dict[str, Any]],
+    max_total: int,
+    supported_limit: int,
+    abstain_limit: int,
+    boundary_limit: int,
+    finish_limit: int,
+    rng: random.Random,
+) -> list[dict[str, Any]]:
+    if supported_limit <= 0 and abstain_limit <= 0 and finish_limit <= 0:
+        return balanced_sample(continuation_rows + finish_rows + boundary_rows, max_total, rng)
+
+    selected: list[dict[str, Any]] = []
+    selected.extend(sample_patch_type(continuation_rows, "supported_claim_requires_evidence_ids", supported_limit, rng))
+    selected.extend(sample_patch_type(continuation_rows, "abstain_remaining_field", abstain_limit, rng))
+    selected.extend(balanced_sample(boundary_rows, boundary_limit, rng))
+    selected.extend(sample_patch_type(finish_rows, "finish_ready_only_after_all_fields_done", finish_limit, rng))
+
+    selected_object_ids = {id(row) for row in selected}
+    if len(selected) < max_total:
+        remaining = [
+            row
+            for row in continuation_rows + finish_rows + boundary_rows
+            if id(row) not in selected_object_ids
+        ]
+        selected.extend(balanced_sample(remaining, max_total - len(selected), rng))
+    rng.shuffle(selected)
+    if max_total > 0 and len(selected) > max_total:
+        selected = balanced_sample(selected, max_total, rng)
+    return selected
+
+
+def sample_patch_type(rows: list[dict[str, Any]], patch_type: str, limit: int, rng: random.Random) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    return balanced_sample([row for row in rows if get_patch_type(row) == patch_type], limit, rng)
+
+
 def balanced_sample(rows: list[dict[str, Any]], limit: int, rng: random.Random) -> list[dict[str, Any]]:
     if limit <= 0 or limit >= len(rows):
         out = list(rows)
@@ -476,6 +560,10 @@ def balanced_sample(rows: list[dict[str, Any]], limit: int, rng: random.Random) 
             keys = sorted(buckets)
             cursor = 0
     return selected
+
+
+def get_patch_type(row: dict[str, Any]) -> str:
+    return str((row.get("patch_meta") or {}).get("patch_type") or row.get("label_source") or "")
 
 
 def index_write_rows(sft_rows_by_split: dict[str, list[dict[str, Any]]]) -> dict[tuple[str, str], dict[str, Any]]:

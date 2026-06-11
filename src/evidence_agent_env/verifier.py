@@ -144,6 +144,15 @@ class EvidenceVerifier:
         evidence_hits = selected_ids & gold_ids
         evidence_precision = len(evidence_hits) / max(1, len(selected_ids))
         evidence_recall = len(evidence_hits) / max(1, len(gold_ids))
+        retrieved_ids = retrieved_evidence_ids_from(tool_results)
+        opened_ids = opened_evidence_ids_from(history, tool_results)
+        cited_ids = cited_evidence_ids_from(draft_claims)
+        retrieved_hits = retrieved_ids & gold_ids
+        opened_hits = opened_ids & gold_ids
+        cited_hits = cited_ids & gold_ids
+        retrieved_recall = len(retrieved_hits) / max(1, len(gold_ids))
+        opened_recall = len(opened_hits) / max(1, len(gold_ids))
+        cited_recall = len(cited_hits) / max(1, len(gold_ids))
 
         claim_metrics = self.claim_metrics(task, draft_claims)
         steps = len(history)
@@ -201,6 +210,15 @@ class EvidenceVerifier:
             "evidence_hit_count": len(evidence_hits),
             "evidence_precision": round(evidence_precision, 6),
             "evidence_recall": round(evidence_recall, 6),
+            "retrieved_evidence_count": len(retrieved_ids),
+            "opened_evidence_count": len(opened_ids),
+            "cited_evidence_count": len(cited_ids),
+            "retrieved_evidence_hit_count": len(retrieved_hits),
+            "opened_evidence_hit_count": len(opened_hits),
+            "cited_evidence_hit_count": len(cited_hits),
+            "retrieved_evidence_recall": round(retrieved_recall, 6),
+            "opened_evidence_recall": round(opened_recall, 6),
+            "cited_evidence_recall": round(cited_recall, 6),
             "efficiency": round(efficiency, 6),
             **claim_metrics,
         }
@@ -361,6 +379,45 @@ def gold_evidence_ids(task: dict[str, Any]) -> set[str]:
         ids.update(str(eid) for eid in item.get("candidate_evidence_ids") or [])
     ids.update(str(eid) for eid in task.get("gold", {}).get("evidence_ids") or [])
     ids.update(str(eid) for eid in task.get("gold", {}).get("candidate_evidence_ids") or [])
+    return ids
+
+
+def retrieved_evidence_ids_from(tool_results: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for result in tool_results:
+        if not isinstance(result, dict) or result.get("tool") != "retrieve_evidence":
+            continue
+        ids.update(str(eid) for eid in result.get("hit_evidence_ids") or [])
+        for item in result.get("results") or []:
+            if isinstance(item, dict) and item.get("evidence_id"):
+                ids.add(str(item.get("evidence_id")))
+    return ids
+
+
+def opened_evidence_ids_from(history: list[dict[str, Any]], tool_results: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for action, result in zip(history, tool_results):
+        if not isinstance(action, dict) or action.get("action") != "open_evidence":
+            continue
+        evidence_id = action.get("evidence_id")
+        if evidence_id and isinstance(result, dict) and not result.get("error"):
+            ids.add(str(evidence_id))
+    for result in tool_results:
+        if (
+            isinstance(result, dict)
+            and result.get("tool") == "open_evidence"
+            and result.get("evidence_id")
+            and not result.get("error")
+        ):
+            ids.add(str(result.get("evidence_id")))
+    return ids
+
+
+def cited_evidence_ids_from(draft_claims: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for claim in draft_claims:
+        if isinstance(claim, dict):
+            ids.update(str(eid) for eid in claim.get("evidence_ids") or [])
     return ids
 
 
