@@ -378,10 +378,21 @@ def summarize_one(
         "trajectory_success": bool(trajectory_metrics.get("trajectory_success")),
         "final_reward": trajectory_metrics.get("final_reward"),
         "claim_supported_rate": trajectory_metrics.get("claim_supported_rate"),
+        "claim_support_precision": trajectory_metrics.get("claim_support_precision"),
+        "claim_support_recall": trajectory_metrics.get("claim_support_recall"),
+        "claim_support_f1": trajectory_metrics.get("claim_support_f1"),
         "evidence_recall": trajectory_metrics.get("evidence_recall"),
+        "evidence_precision": trajectory_metrics.get("evidence_precision"),
+        "evidence_f1": trajectory_metrics.get("evidence_f1"),
+        "retrieved_evidence_precision": trajectory_metrics.get("retrieved_evidence_precision"),
         "retrieved_evidence_recall": trajectory_metrics.get("retrieved_evidence_recall"),
+        "retrieved_evidence_f1": trajectory_metrics.get("retrieved_evidence_f1"),
+        "opened_evidence_precision": trajectory_metrics.get("opened_evidence_precision"),
         "opened_evidence_recall": trajectory_metrics.get("opened_evidence_recall"),
+        "opened_evidence_f1": trajectory_metrics.get("opened_evidence_f1"),
+        "cited_evidence_precision": trajectory_metrics.get("cited_evidence_precision"),
         "cited_evidence_recall": trajectory_metrics.get("cited_evidence_recall"),
+        "cited_evidence_f1": trajectory_metrics.get("cited_evidence_f1"),
         "retrieved_evidence_count": trajectory_metrics.get("retrieved_evidence_count"),
         "opened_evidence_count": trajectory_metrics.get("opened_evidence_count"),
         "cited_evidence_count": trajectory_metrics.get("cited_evidence_count"),
@@ -392,6 +403,12 @@ def summarize_one(
         "invalid_step_rate": trajectory_metrics.get("invalid_step_rate"),
         "core_supported_count": trajectory_metrics.get("core_supported_count"),
         "core_supported_rate": trajectory_metrics.get("core_supported_rate"),
+        "core_support_precision": trajectory_metrics.get("core_support_precision"),
+        "core_support_recall": trajectory_metrics.get("core_support_recall"),
+        "core_support_f1": trajectory_metrics.get("core_support_f1"),
+        "abstain_precision": trajectory_metrics.get("abstain_precision"),
+        "abstain_recall": trajectory_metrics.get("abstain_recall"),
+        "abstain_f1": trajectory_metrics.get("abstain_f1"),
         "core_field_match_count": trajectory_metrics.get("core_field_match_count"),
         "core_field_recall": trajectory_metrics.get("core_field_recall"),
         "local_caption_only_claim_count": trajectory_metrics.get("local_caption_only_claim_count"),
@@ -633,17 +650,82 @@ def build_summary(
             / n,
             "mean_final_reward": sum(float(item.get("trajectory_metrics", {}).get("final_reward", 0.0)) for item in records) / n,
             "mean_claim_supported_rate": sum(float(item.get("trajectory_metrics", {}).get("claim_supported_rate", 0.0)) for item in records) / n,
+            "mean_claim_support_precision": sum(
+                float(item.get("trajectory_metrics", {}).get("claim_support_precision", 0.0)) for item in records
+            )
+            / n,
+            "mean_claim_support_recall": sum(
+                float(item.get("trajectory_metrics", {}).get("claim_support_recall", 0.0)) for item in records
+            )
+            / n,
+            "mean_claim_support_f1": sum(
+                float(item.get("trajectory_metrics", {}).get("claim_support_f1", 0.0)) for item in records
+            )
+            / n,
+            "mean_core_support_precision": sum(
+                float(item.get("trajectory_metrics", {}).get("core_support_precision", 0.0)) for item in records
+            )
+            / n,
+            "mean_core_support_recall": sum(
+                float(item.get("trajectory_metrics", {}).get("core_support_recall", 0.0)) for item in records
+            )
+            / n,
+            "mean_core_support_f1": sum(
+                float(item.get("trajectory_metrics", {}).get("core_support_f1", 0.0)) for item in records
+            )
+            / n,
+            "mean_abstain_precision": sum(
+                float(item.get("trajectory_metrics", {}).get("abstain_precision", 0.0)) for item in records
+            )
+            / n,
+            "mean_abstain_recall": sum(
+                float(item.get("trajectory_metrics", {}).get("abstain_recall", 0.0)) for item in records
+            )
+            / n,
+            "mean_abstain_f1": sum(
+                float(item.get("trajectory_metrics", {}).get("abstain_f1", 0.0)) for item in records
+            )
+            / n,
+            "mean_evidence_precision": sum(
+                float(item.get("trajectory_metrics", {}).get("evidence_precision", 0.0)) for item in records
+            )
+            / n,
             "mean_evidence_recall": sum(float(item.get("trajectory_metrics", {}).get("evidence_recall", 0.0)) for item in records) / n,
+            "mean_evidence_f1": sum(float(item.get("trajectory_metrics", {}).get("evidence_f1", 0.0)) for item in records) / n,
+            "mean_retrieved_evidence_precision": sum(
+                float(item.get("trajectory_metrics", {}).get("retrieved_evidence_precision", 0.0)) for item in records
+            )
+            / n,
             "mean_retrieved_evidence_recall": sum(
                 float(item.get("trajectory_metrics", {}).get("retrieved_evidence_recall", 0.0)) for item in records
+            )
+            / n,
+            "mean_retrieved_evidence_f1": sum(
+                float(item.get("trajectory_metrics", {}).get("retrieved_evidence_f1", 0.0)) for item in records
+            )
+            / n,
+            "mean_opened_evidence_precision": sum(
+                float(item.get("trajectory_metrics", {}).get("opened_evidence_precision", 0.0)) for item in records
             )
             / n,
             "mean_opened_evidence_recall": sum(
                 float(item.get("trajectory_metrics", {}).get("opened_evidence_recall", 0.0)) for item in records
             )
             / n,
+            "mean_opened_evidence_f1": sum(
+                float(item.get("trajectory_metrics", {}).get("opened_evidence_f1", 0.0)) for item in records
+            )
+            / n,
+            "mean_cited_evidence_precision": sum(
+                float(item.get("trajectory_metrics", {}).get("cited_evidence_precision", 0.0)) for item in records
+            )
+            / n,
             "mean_cited_evidence_recall": sum(
                 float(item.get("trajectory_metrics", {}).get("cited_evidence_recall", 0.0)) for item in records
+            )
+            / n,
+            "mean_cited_evidence_f1": sum(
+                float(item.get("trajectory_metrics", {}).get("cited_evidence_f1", 0.0)) for item in records
             )
             / n,
             "mean_retrieved_evidence_count": sum(
@@ -789,10 +871,27 @@ def write_markdown_report(path: Path, summary: dict[str, Any], records: list[dic
         f"- mean_total_reward: {metrics['mean_total_reward']:.3f}",
         f"- mean_final_reward: {metrics['mean_final_reward']:.3f}",
         f"- mean_claim_supported_rate: {metrics['mean_claim_supported_rate']:.3f}",
+        f"- mean_claim_support_precision: {metrics.get('mean_claim_support_precision', 0.0):.3f}",
+        f"- mean_claim_support_recall: {metrics.get('mean_claim_support_recall', 0.0):.3f}",
+        f"- mean_claim_support_f1: {metrics.get('mean_claim_support_f1', 0.0):.3f}",
+        f"- mean_core_support_precision: {metrics.get('mean_core_support_precision', 0.0):.3f}",
+        f"- mean_core_support_recall: {metrics.get('mean_core_support_recall', 0.0):.3f}",
+        f"- mean_core_support_f1: {metrics.get('mean_core_support_f1', 0.0):.3f}",
+        f"- mean_abstain_precision: {metrics.get('mean_abstain_precision', 0.0):.3f}",
+        f"- mean_abstain_recall: {metrics.get('mean_abstain_recall', 0.0):.3f}",
+        f"- mean_abstain_f1: {metrics.get('mean_abstain_f1', 0.0):.3f}",
+        f"- mean_evidence_precision: {metrics.get('mean_evidence_precision', 0.0):.3f}",
         f"- mean_evidence_recall: {metrics['mean_evidence_recall']:.3f}",
+        f"- mean_evidence_f1: {metrics.get('mean_evidence_f1', 0.0):.3f}",
+        f"- mean_retrieved_evidence_precision: {metrics.get('mean_retrieved_evidence_precision', 0.0):.3f}",
         f"- mean_retrieved_evidence_recall: {metrics.get('mean_retrieved_evidence_recall', 0.0):.3f}",
+        f"- mean_retrieved_evidence_f1: {metrics.get('mean_retrieved_evidence_f1', 0.0):.3f}",
+        f"- mean_opened_evidence_precision: {metrics.get('mean_opened_evidence_precision', 0.0):.3f}",
         f"- mean_opened_evidence_recall: {metrics.get('mean_opened_evidence_recall', 0.0):.3f}",
+        f"- mean_opened_evidence_f1: {metrics.get('mean_opened_evidence_f1', 0.0):.3f}",
+        f"- mean_cited_evidence_precision: {metrics.get('mean_cited_evidence_precision', 0.0):.3f}",
         f"- mean_cited_evidence_recall: {metrics.get('mean_cited_evidence_recall', 0.0):.3f}",
+        f"- mean_cited_evidence_f1: {metrics.get('mean_cited_evidence_f1', 0.0):.3f}",
         f"- mean_retrieved_evidence_count: {metrics.get('mean_retrieved_evidence_count', 0.0):.3f}",
         f"- mean_opened_evidence_count: {metrics.get('mean_opened_evidence_count', 0.0):.3f}",
         f"- mean_cited_evidence_count: {metrics.get('mean_cited_evidence_count', 0.0):.3f}",
@@ -838,7 +937,10 @@ def write_markdown_report(path: Path, summary: dict[str, Any], records: list[dic
                 f"- candidate_oracle_iou: {metrics_one.get('candidate_oracle_iou')}; candidate_oracle_rank: {metrics_one.get('candidate_oracle_rank')}; crop_region_called: {metrics_one.get('crop_region_called')}; selected_region_iou: {metrics_one.get('selected_region_iou')}; selected_region_id: {metrics_one.get('selected_region_id')}",
                 f"- evidence_hit_count: {metrics_one.get('evidence_hit_count')}; claim_count: {metrics_one.get('claim_count')}; has_finish_action: {metrics_one.get('has_finish_action')}; has_finish: {metrics_one.get('has_finish')}; premature_finish_count: {metrics_one.get('premature_finish_count')}",
                 f"- trajectory_success: {metrics_one.get('trajectory_success')}; final_reward: {metrics_one.get('final_reward')}; claim_supported_rate: {metrics_one.get('claim_supported_rate')}; evidence_recall: {metrics_one.get('evidence_recall')}",
+                f"- claim support: precision={metrics_one.get('claim_support_precision')}; recall={metrics_one.get('claim_support_recall')}; f1={metrics_one.get('claim_support_f1')}; core_f1={metrics_one.get('core_support_f1')}; abstain_f1={metrics_one.get('abstain_f1')}",
+                f"- evidence prf: precision={metrics_one.get('evidence_precision')}; recall={metrics_one.get('evidence_recall')}; f1={metrics_one.get('evidence_f1')}",
                 f"- evidence flow: retrieved_recall={metrics_one.get('retrieved_evidence_recall')}; opened_recall={metrics_one.get('opened_evidence_recall')}; cited_recall={metrics_one.get('cited_evidence_recall')}; retrieved_hits={metrics_one.get('retrieved_evidence_hit_count')}; opened_hits={metrics_one.get('opened_evidence_hit_count')}; cited_hits={metrics_one.get('cited_evidence_hit_count')}",
+                f"- evidence flow prf: retrieved_p/r/f1={metrics_one.get('retrieved_evidence_precision')}/{metrics_one.get('retrieved_evidence_recall')}/{metrics_one.get('retrieved_evidence_f1')}; opened_p/r/f1={metrics_one.get('opened_evidence_precision')}/{metrics_one.get('opened_evidence_recall')}/{metrics_one.get('opened_evidence_f1')}; cited_p/r/f1={metrics_one.get('cited_evidence_precision')}/{metrics_one.get('cited_evidence_recall')}/{metrics_one.get('cited_evidence_f1')}",
                 f"- field_policy_selection_score: {metrics_one.get('field_policy_selection_score')}",
                 f"- local caption use: local_only={metrics_one.get('local_caption_only_claim_count')}; risk_field={metrics_one.get('local_caption_only_risk_field_claim_count')}; unsupported={metrics_one.get('local_caption_only_unsupported_count')}",
                 f"- mask_violation_count: {metrics_one.get('mask_violation_count')}; mask_violation_rate: {metrics_one.get('mask_violation_rate')}",

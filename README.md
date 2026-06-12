@@ -169,6 +169,36 @@ Decision:
 - Counterfactual replay data has been built but not trained:
   `/root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_0_4_counterfactual_field_policy_replay_20260612_1144`
 
+### Precision/F1 Metric Update
+
+Report:
+
+`docs/02_指标与数据/v1.0.4PrecisionF1指标补充说明_20260612.md`
+
+The evaluator now reports precision, recall, and F1 for claim support and evidence flow, instead of relying on recall alone.
+
+| Metric | Baseline val50 | Behavior Repair C val50 |
+|---|---:|---:|
+| claim_support_precision | 0.905 | 1.000 |
+| claim_support_recall | 0.634 | 0.359 |
+| claim_support_f1 | 0.687 | 0.520 |
+| evidence_precision | 1.000 | 0.996 |
+| evidence_recall | 0.493 | 0.538 |
+| evidence_f1 | 0.637 | 0.689 |
+| cited_evidence_f1 | 0.200 | 0.200 |
+
+This changes the interpretation of Behavior Repair C: it improves evidence recall/F1 but reduces claim support F1, so it remains a negative result.
+
+| Metric | Baseline first16 | Field-policy probe val16 |
+|---|---:|---:|
+| claim_support_precision | 0.914 | 0.742 |
+| claim_support_recall | 0.661 | 0.823 |
+| claim_support_f1 | 0.713 | 0.730 |
+| opened_evidence_f1 | 0.282 | 0.312 |
+| cited_evidence_f1 | 0.200 | 0.210 |
+
+This confirms the field-policy probe is promising but not safe enough to scale: recall improved, while precision dropped. Future selection should prioritize `claim_support_f1`, `claim_support_precision`, `cited_evidence_f1`, and local-caption-only risk diagnostics together.
+
 ## Reproducing Main Evaluation
 
 Baseline val50:
@@ -274,7 +304,7 @@ Large datasets, model weights, and rollout outputs are kept outside git unless e
 
 Recommended next steps:
 
-1. Refine the field-policy prompt/mask so risk fields with only local caption prefer abstain or external open, without increasing no-retrieve/write-before-retrieve.
+1. Refine the field-policy prompt/mask and select by claim/evidence precision-F1, not recall alone.
 2. Re-run a small val16/val24 probe before any full val50 run.
 3. Patch remaining GoldEval caption-boundary candidates such as `001631`, `001602`, and `001887`.
 4. Run a small page-image retrieval probe using ColPali/VisRAG-style retrieval before changing the main evidence index.

@@ -183,15 +183,22 @@ class EvidenceVerifier:
         evidence_hits = selected_ids & gold_ids
         evidence_precision = len(evidence_hits) / max(1, len(selected_ids))
         evidence_recall = len(evidence_hits) / max(1, len(gold_ids))
+        evidence_f1 = f1_score(evidence_precision, evidence_recall)
         retrieved_ids = retrieved_evidence_ids_from(tool_results)
         opened_ids = opened_evidence_ids_from(history, tool_results)
         cited_ids = cited_evidence_ids_from(draft_claims)
         retrieved_hits = retrieved_ids & gold_ids
         opened_hits = opened_ids & gold_ids
         cited_hits = cited_ids & gold_ids
+        retrieved_precision = len(retrieved_hits) / max(1, len(retrieved_ids))
         retrieved_recall = len(retrieved_hits) / max(1, len(gold_ids))
+        retrieved_f1 = f1_score(retrieved_precision, retrieved_recall)
+        opened_precision = len(opened_hits) / max(1, len(opened_ids))
         opened_recall = len(opened_hits) / max(1, len(gold_ids))
+        opened_f1 = f1_score(opened_precision, opened_recall)
+        cited_precision = len(cited_hits) / max(1, len(cited_ids))
         cited_recall = len(cited_hits) / max(1, len(gold_ids))
+        cited_f1 = f1_score(cited_precision, cited_recall)
 
         claim_metrics = self.claim_metrics(task, draft_claims)
         steps = len(history)
@@ -265,15 +272,22 @@ class EvidenceVerifier:
             "evidence_hit_count": len(evidence_hits),
             "evidence_precision": round(evidence_precision, 6),
             "evidence_recall": round(evidence_recall, 6),
+            "evidence_f1": round(evidence_f1, 6),
             "retrieved_evidence_count": len(retrieved_ids),
             "opened_evidence_count": len(opened_ids),
             "cited_evidence_count": len(cited_ids),
             "retrieved_evidence_hit_count": len(retrieved_hits),
             "opened_evidence_hit_count": len(opened_hits),
             "cited_evidence_hit_count": len(cited_hits),
+            "retrieved_evidence_precision": round(retrieved_precision, 6),
             "retrieved_evidence_recall": round(retrieved_recall, 6),
+            "retrieved_evidence_f1": round(retrieved_f1, 6),
+            "opened_evidence_precision": round(opened_precision, 6),
             "opened_evidence_recall": round(opened_recall, 6),
+            "opened_evidence_f1": round(opened_f1, 6),
+            "cited_evidence_precision": round(cited_precision, 6),
             "cited_evidence_recall": round(cited_recall, 6),
+            "cited_evidence_f1": round(cited_f1, 6),
             "field_policy_selection_score": round(field_policy_selection_score, 6),
             "reward_mode": self.reward_mode,
             "efficiency": round(efficiency, 6),
@@ -289,6 +303,11 @@ class EvidenceVerifier:
 
         gold_supported = [item for item in gold_claims if not item.get("abstain")]
         gold_abstains = [item for item in gold_claims if item.get("abstain")]
+        predicted_non_abstain = [item for item in draft_claims if not item.get("abstain")]
+        predicted_abstains = [item for item in draft_claims if item.get("abstain")]
+        core_predicted_non_abstain = [
+            item for item in predicted_non_abstain if str(item.get("field") or "") in CORE_CLAIM_FIELDS
+        ]
         supported_count = 0
         unsupported_count = 0
         correct_abstains = 0
@@ -332,11 +351,20 @@ class EvidenceVerifier:
                 if field in CORE_CLAIM_FIELDS:
                     core_unsupported_count += 1
 
+        claim_support_precision = supported_count / max(1, len(predicted_non_abstain))
+        claim_support_recall = supported_count / max(1, len(gold_supported))
+        core_support_precision = core_supported_count / max(1, len(core_predicted_non_abstain))
+        core_support_recall = core_supported_count / max(1, len(CORE_CLAIM_FIELDS))
+        abstain_precision = correct_abstains / max(1, len(predicted_abstains))
+        abstain_recall = correct_abstains / max(1, len(gold_abstains))
+
         return {
             "gold_claim_count": len(gold_claims),
             "gold_supported_claim_count": len(gold_supported),
             "gold_abstain_count": len(gold_abstains),
             "predicted_claim_count": len(draft_claims),
+            "predicted_non_abstain_claim_count": len(predicted_non_abstain),
+            "predicted_abstain_count": len(predicted_abstains),
             "field_match_count": field_match_count,
             "supported_claim_count": supported_count,
             "unsupported_claim_count": unsupported_count,
@@ -346,12 +374,21 @@ class EvidenceVerifier:
             "local_caption_only_claim_count": local_caption_only_claim_count,
             "local_caption_only_risk_field_claim_count": local_caption_only_risk_field_claim_count,
             "local_caption_only_unsupported_count": local_caption_only_unsupported_count,
+            "claim_support_precision": claim_support_precision,
+            "claim_support_recall": claim_support_recall,
+            "claim_support_f1": f1_score(claim_support_precision, claim_support_recall),
+            "core_support_precision": core_support_precision,
+            "core_support_recall": core_support_recall,
+            "core_support_f1": f1_score(core_support_precision, core_support_recall),
+            "abstain_precision": abstain_precision,
+            "abstain_recall": abstain_recall,
+            "abstain_f1": f1_score(abstain_precision, abstain_recall),
             "core_supported_rate": core_supported_count / max(1, len(CORE_CLAIM_FIELDS)),
             "core_field_recall": core_field_match_count / max(1, len(CORE_CLAIM_FIELDS)),
             "correct_abstain_count": correct_abstains,
-            "claim_supported_rate": supported_count / max(1, len(gold_supported)),
+            "claim_supported_rate": claim_support_recall,
             "claim_field_recall": field_match_count / max(1, len(gold_claims)),
-            "abstain_accuracy": correct_abstains / max(1, len(gold_abstains)),
+            "abstain_accuracy": abstain_recall,
         }
 
     def crop_iou(self, task: dict[str, Any], bbox: Any) -> float:
@@ -428,6 +465,12 @@ def claim_field_allowed(field: str, allowed_fields: list[Any]) -> bool:
     normalized = FIELD_ALIASES.get(str(field), str(field))
     allowed = {FIELD_ALIASES.get(str(item), str(item)) for item in allowed_fields}
     return normalized in allowed
+
+
+def f1_score(precision: float, recall: float) -> float:
+    if precision <= 0.0 or recall <= 0.0:
+        return 0.0
+    return 2.0 * precision * recall / max(1e-12, precision + recall)
 
 
 def field_policy_score(
