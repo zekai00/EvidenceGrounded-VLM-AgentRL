@@ -36,6 +36,7 @@ class PromptConfig:
     region_selection_hint: bool = True
     strict_claim_phase_hint: bool = False
     dynamic_tool_schema: bool = False
+    field_policy_prompt: bool = False
 
 
 def build_messages_from_observation(
@@ -108,6 +109,8 @@ def build_prompt_text(obs: dict[str, Any], config: PromptConfig) -> str:
     ]
     if phase_hints:
         lines.extend(phase_hints)
+    if config.field_policy_prompt:
+        lines.extend(field_policy_prompt_lines(obs))
     if config.coordinate_info:
         image_info = [
             {"index": index + 1, "role": item.get("role"), "path": item.get("path"), "size": image_size(item.get("path"))}
@@ -180,6 +183,19 @@ def build_prompt_text(obs: dict[str, Any], config: PromptConfig) -> str:
     return "\n".join(lines)
 
 
+def field_policy_prompt_lines(obs: dict[str, Any]) -> list[str]:
+    remaining = list((obs.get("claim_state") or {}).get("remaining_fields") or [])
+    return [
+        "字段级 evidence policy probe：",
+        "1. 每个非 abstain claim 必须引用能够支持该字段的 evidence_id；不能因为一个 evidence 与作品相关，就把它用于所有字段。",
+        "2. local_caption 主要支持 caption_text，以及图注中明确出现的题名、作者、朝代、尺寸、馆藏；不能默认支持 image_scope、displayed_region、object_type。",
+        "3. image_scope/displayed_region/object_type 只有在 evidence 文本明确说明全幅/局部/册页/细部/对象类型时才可写；否则应 retrieve/open 外部 evidence，仍不足则 abstain。",
+        "4. retrieve_evidence 后，如果要用检索结果支持 claim，必须先 open_evidence 读取对应 evidence；不要只检索不打开就写 claim。",
+        "当前 remaining_fields："
+        + json.dumps(remaining, ensure_ascii=False, separators=(",", ":")),
+    ]
+
+
 def final_action_guard(obs: dict[str, Any], config: PromptConfig, current_claim_state: dict[str, Any]) -> str:
     allowed = list(obs.get("available_actions") or [])
     if not allowed:
@@ -243,12 +259,19 @@ def claim_phase_hint(obs: dict[str, Any], config: PromptConfig, current_claim_st
     if config.strict_claim_phase_hint and phase in {"claim_writing", "claim_continuation"}:
         if remaining:
             blocked_tools = "open_evidence、retrieve_evidence" if config.tool_schema == "no_select" else "open_evidence、retrieve_evidence 或 select_evidence"
+            extra = ""
+            if config.field_policy_prompt:
+                extra = (
+                    "对于 image_scope、displayed_region、object_type，如果当前只有 local_caption 且图注没有明确支持，"
+                    "本阶段应对该字段 abstain，不要用 local_caption 硬写。"
+                )
             return (
                 f"阶段提示：当前已经进入 claim 写入阶段，当前阶段禁止继续 {blocked_tools}。"
                 "如果 current_claim_state.remaining_fields 仍有字段，下一步必须优先调用 write_claims_chunk，"
                 "一次只写 1 个尚未写过的字段；也可以用 write_claim 写单个字段。"
                 "证据不足的字段用 abstain_claim 或 write_claims_chunk.abstains。"
                 "不要重复已经在 written_fields 或 abstained_fields 中出现的字段；复杂字段必须简短，避免超长 JSON。"
+                + extra
             )
         return "阶段提示：当前 claim 字段已经写完或 abstain 完成，下一步必须调用 finish。"
     if not remaining:
@@ -261,11 +284,15 @@ def claim_phase_hint(obs: dict[str, Any], config: PromptConfig, current_claim_st
     has_retrieved = "retrieve_evidence" in history_actions or "retrieve_evidence" in tool_names
     if has_evidence and (has_prepared_image or has_retrieved):
         evidence_phrase = "已有 open_evidence 或工具返回中的 evidence" if config.tool_schema == "no_select" else "已有 selected_evidence_ids 或工具返回中的 evidence"
+        extra = ""
+        if config.field_policy_prompt:
+            extra = "写每个字段前检查 claim_use_hint/adjudicated_claim_allowed_fields；非 caption 字段不能默认复用 local_caption。"
         return (
             "阶段提示：当前通常已经完成候选区域选择、裁剪、证据检索和证据打开；"
             f"如果 claim_state 显示仍有待写字段，并且{evidence_phrase}，"
             "优先调用 write_claims_chunk 写入下一组结构化 claim。"
             "每次只写 1 个字段，复杂字段必须简短。除非明确缺少必要证据，否则不要继续 open_evidence 或 finish。"
+            + extra
         )
     return ""
 
@@ -533,6 +560,8 @@ def simplify_tool_result(result: Any, config: PromptConfig) -> Any:
         for key in EVIDENCE_POLICY_KEYS:
             if key in result and result.get(key) is not None:
                 simplified[key] = result.get(key)
+        if config.field_policy_prompt and result.get("claim_use_hint"):
+            simplified["claim_use_hint"] = result.get("claim_use_hint")
         for key in ["display_snippet", "evidence_summary", "text", "raw_chunk_text"]:
             if result.get(key):
                 simplified[key] = truncate_text(str(result.get(key)), config.snippet_chars)
@@ -571,6 +600,8 @@ def simplify_evidence(item: Any, config: PromptConfig) -> Any:
     for key in EVIDENCE_POLICY_KEYS:
         if key in item and item.get(key) is not None:
             simplified[key] = item.get(key)
+    if config.field_policy_prompt and item.get("claim_use_hint"):
+        simplified["claim_use_hint"] = item.get("claim_use_hint")
     return simplified
 
 

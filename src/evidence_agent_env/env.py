@@ -36,6 +36,8 @@ class EvidenceAgentEnv:
         enforce_tool_mask: bool = False,
         tool_schema: str = "chunked_claim",
         target_claim_fields: list[str] | None = None,
+        reward_mode: str = "default",
+        field_policy_hints: bool = False,
     ) -> None:
         self.tasks_path = Path(tasks_path)
         self.evidence_index_dir = Path(evidence_index_dir)
@@ -46,9 +48,11 @@ class EvidenceAgentEnv:
         self.enforce_tool_mask = enforce_tool_mask
         self.tool_schema = tool_schema
         self.target_claim_fields = list(target_claim_fields or DEFAULT_CLAIM_FIELDS)
+        self.reward_mode = str(reward_mode or "default")
+        self.field_policy_hints = bool(field_policy_hints)
         self.tasks = read_jsonl(self.tasks_path)
         self.index: EvidenceIndex | None = None
-        self.verifier = EvidenceVerifier(self.evidence_index_dir)
+        self.verifier = EvidenceVerifier(self.evidence_index_dir, reward_mode=self.reward_mode)
         self.task: dict[str, Any] | None = None
         self.history: list[dict[str, Any]] = []
         self.tool_results: list[dict[str, Any]] = []
@@ -117,6 +121,8 @@ class EvidenceAgentEnv:
                 "invalid_step_count": self.invalid_step_count,
                 "selected_evidence_ids": self.selected_evidence_ids,
                 "visible_evidence_ids": sorted(self._visible_evidence_items()),
+                "history": self.history,
+                "tool_results": self.tool_results,
             },
         )
         terminated = action.get("action") == "finish" or self.step_count + 1 >= self.max_steps
@@ -147,6 +153,8 @@ class EvidenceAgentEnv:
             "valid_crop_count": self.valid_crop_count,
             "last_crop_path": self.last_crop,
             "tool_schema": self.tool_schema,
+            "reward_mode": self.reward_mode,
+            "field_policy_hints": self.field_policy_hints,
             "available_actions": schema_actions(self.tool_schema),
         }
         if self.phase_aware_mask:
@@ -257,6 +265,7 @@ class EvidenceAgentEnv:
                 "adjudication_status": item.get("adjudication_status"),
                 "adjudicated_claim_allowed_fields": item.get("adjudicated_claim_allowed_fields"),
                 "usable_for_claim_by_adjudication": item.get("usable_for_claim_by_adjudication"),
+                "claim_use_hint": self._claim_use_hint(item),
                 "display_snippet": item.get("display_snippet") or item.get("evidence_summary") or item.get("text", "")[:600],
             }
         if name == "write_claim":
@@ -303,6 +312,7 @@ class EvidenceAgentEnv:
                 "page_end": item.get("page_end"),
                 "authority_level": item.get("authority_level"),
                 "citation_level": item.get("citation_level"),
+                "claim_use_hint": self._claim_use_hint(item),
                 "display_snippet": item.get("display_snippet") or item.get("text", ""),
             }
         return None
@@ -382,6 +392,7 @@ class EvidenceAgentEnv:
             "adjudication_status": item.get("adjudication_status"),
             "adjudicated_claim_allowed_fields": item.get("adjudicated_claim_allowed_fields"),
             "usable_for_claim_by_adjudication": item.get("usable_for_claim_by_adjudication"),
+            "claim_use_hint": self._claim_use_hint(item),
             "display_snippet": item.get("display_snippet") or item.get("evidence_summary") or item.get("text", ""),
         }
 
@@ -426,10 +437,26 @@ class EvidenceAgentEnv:
                     "source_file": item.get("source_file"),
                     "page_start": item.get("page_start") if item.get("page_start") is not None else item.get("page"),
                     "citation_level": item.get("citation_level"),
+                    "claim_use_hint": self._claim_use_hint(item),
                     "display_snippet": snippet,
                 }
             )
         return hints[:3]
+
+    def _claim_use_hint(self, item: dict[str, Any]) -> str | None:
+        if not self.field_policy_hints:
+            return None
+        evidence_id = str(item.get("evidence_id") or "")
+        allowed = item.get("adjudicated_claim_allowed_fields") or item.get("claim_allowed_fields") or []
+        if allowed:
+            return "只能支持这些字段：" + ",".join(str(field) for field in allowed)
+        if evidence_id.startswith("local_caption_") or str(item.get("citation_level") or "").endswith("caption_region"):
+            return (
+                "local caption 通常只适合支持 caption_text 和图注中明确出现的题名/作者/朝代/尺寸/馆藏；"
+                "不要默认用它支持 image_scope、displayed_region、object_type。"
+                "如果这些字段没有被图注明确说明，应 retrieve/open 外部 evidence，或 abstain。"
+            )
+        return "只有当文本明确支持目标字段时才可引用；不能用同一 evidence 泛化支持无关字段。"
 
     def _annotate_caption_links(self, regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         linked_regions = [dict(item) for item in regions]

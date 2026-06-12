@@ -35,6 +35,15 @@ CORE_CLAIM_FIELDS = {
     "object_type",
 }
 
+LOCAL_CAPTION_RISK_FIELDS = {
+    "image_scope",
+    "displayed_region",
+    "object_type",
+    "visual_elements",
+    "technique",
+    "composition",
+}
+
 NO_CLAIM_EVIDENCE_ROLES = {
     "toc",
     "bibliography",
@@ -50,8 +59,9 @@ FIELD_ALIASES = {
 
 
 class EvidenceVerifier:
-    def __init__(self, evidence_index_dir: str | Path | None = None) -> None:
+    def __init__(self, evidence_index_dir: str | Path | None = None, *, reward_mode: str = "default") -> None:
         self.evidence_policy_by_id = load_evidence_policy(evidence_index_dir) if evidence_index_dir else {}
+        self.reward_mode = str(reward_mode or "default")
 
     def step_reward(self, task: dict[str, Any], action: dict[str, Any], result: dict[str, Any]) -> float:
         name = action.get("action")
@@ -63,6 +73,8 @@ class EvidenceVerifier:
             if int(result.get("valid_crop_count") or 0) <= 0:
                 return -0.05
             hits = set(result.get("hit_evidence_ids") or [])
+            if self.reward_mode == "field_policy_probe":
+                return 0.06 if hits else 0.02
             return 0.2 if hits else 0.05
         if name == "select_evidence":
             selected = {str(item) for item in action.get("evidence_ids") or []}
@@ -76,10 +88,14 @@ class EvidenceVerifier:
                 return 0.15
             return -0.05
         if name == "open_evidence":
+            if self.reward_mode == "field_policy_probe":
+                return 0.14 if result.get("evidence_id") in gold_evidence_ids(task) else 0.01
             return 0.1 if result.get("evidence_id") in gold_evidence_ids(task) else 0.0
         if name == "write_claim":
             if int(result.get("valid_crop_count") or 0) <= 0:
                 return -0.05
+            if self.reward_mode == "field_policy_probe":
+                return 0.28 if self._claim_supported(task, action) else -0.12
             return 0.2 if self._claim_supported(task, action) else -0.05
         if name == "abstain_claim":
             return 0.1 if self._gold_abstains(task, str(action.get("field"))) else -0.05
@@ -88,16 +104,39 @@ class EvidenceVerifier:
                 return -0.05
             reward = 0.0
             for claim in action.get("claims") or []:
-                reward += 0.2 if self._claim_supported(task, claim) else -0.05
+                if self.reward_mode == "field_policy_probe":
+                    reward += 0.28 if self._claim_supported(task, claim) else -0.12
+                else:
+                    reward += 0.2 if self._claim_supported(task, claim) else -0.05
             for abstain in action.get("abstains") or []:
                 reward += 0.1 if self._gold_abstains(task, str(abstain.get("field"))) else -0.05
             return reward
         if name == "finish":
-            return self.final_reward(task, result.get("draft_claims") or [])
+            history = list(result.get("history") or [])
+            tool_results = list(result.get("tool_results") or [])
+            history.append(action)
+            tool_results.append(result)
+            return self.final_reward(
+                task,
+                result.get("draft_claims") or [],
+                history=history,
+                tool_results=tool_results,
+            )
         return 0.0
 
-    def final_reward(self, task: dict[str, Any], draft_claims: list[dict[str, Any]]) -> float:
-        return float(self.trajectory_metrics(task, [], [], draft_claims, max_steps=1)["final_reward"])
+    def final_reward(
+        self,
+        task: dict[str, Any],
+        draft_claims: list[dict[str, Any]],
+        *,
+        history: list[dict[str, Any]] | None = None,
+        tool_results: list[dict[str, Any]] | None = None,
+    ) -> float:
+        return float(
+            self.trajectory_metrics(task, history or [], tool_results or [], draft_claims, max_steps=1)[
+                "final_reward"
+            ]
+        )
 
     def trajectory_metrics(
         self,
@@ -166,24 +205,40 @@ class EvidenceVerifier:
         core_written_bonus = claim_metrics["core_field_match_count"] / max(1, len(CORE_CLAIM_FIELDS))
         core_unsupported_penalty = claim_metrics["core_unsupported_count"] / max(1, len(CORE_CLAIM_FIELDS))
         finish_quality_bonus = 1.0 if finish and claim_metrics["claim_supported_rate"] >= 0.4 else 0.0
+        field_policy_selection_score = field_policy_score(
+            finish=finish,
+            crop_success=crop_success,
+            claim_supported_rate=claim_metrics["claim_supported_rate"],
+            core_supported_bonus=core_supported_bonus,
+            opened_recall=opened_recall,
+            cited_recall=cited_recall,
+            abstain_accuracy=claim_metrics["abstain_accuracy"],
+            invalid_penalty=invalid_penalty,
+            unsupported_penalty=unsupported_penalty,
+            core_unsupported_penalty=core_unsupported_penalty,
+            premature_finish_penalty=premature_finish_penalty,
+        )
 
         # Keep the final reward compact and bounded for GRPO-style relative ranking.
-        final_reward = (
-            0.15 * float(finish)
-            + 0.20 * min(1.0, max_crop_iou)
-            + 0.12 * evidence_hit_bonus
-            + 0.08 * evidence_recall_bonus
-            + 0.22 * claim_metrics["claim_supported_rate"]
-            + 0.18 * core_supported_bonus
-            + 0.04 * core_written_bonus
-            + 0.10 * finish_quality_bonus
-            + 0.05 * claim_metrics["abstain_accuracy"]
-            + 0.05 * efficiency
-            - 0.10 * invalid_penalty
-            - 0.10 * unsupported_penalty
-            - 0.08 * core_unsupported_penalty
-            - 0.25 * premature_finish_penalty
-        )
+        if self.reward_mode == "field_policy_probe":
+            final_reward = field_policy_selection_score
+        else:
+            final_reward = (
+                0.15 * float(finish)
+                + 0.20 * min(1.0, max_crop_iou)
+                + 0.12 * evidence_hit_bonus
+                + 0.08 * evidence_recall_bonus
+                + 0.22 * claim_metrics["claim_supported_rate"]
+                + 0.18 * core_supported_bonus
+                + 0.04 * core_written_bonus
+                + 0.10 * finish_quality_bonus
+                + 0.05 * claim_metrics["abstain_accuracy"]
+                + 0.05 * efficiency
+                - 0.10 * invalid_penalty
+                - 0.10 * unsupported_penalty
+                - 0.08 * core_unsupported_penalty
+                - 0.25 * premature_finish_penalty
+            )
         final_reward = max(-1.0, min(1.0, final_reward))
 
         trajectory_success = (
@@ -219,6 +274,8 @@ class EvidenceVerifier:
             "retrieved_evidence_recall": round(retrieved_recall, 6),
             "opened_evidence_recall": round(opened_recall, 6),
             "cited_evidence_recall": round(cited_recall, 6),
+            "field_policy_selection_score": round(field_policy_selection_score, 6),
+            "reward_mode": self.reward_mode,
             "efficiency": round(efficiency, 6),
             **claim_metrics,
         }
@@ -239,6 +296,9 @@ class EvidenceVerifier:
         core_supported_count = 0
         core_unsupported_count = 0
         core_field_match_count = 0
+        local_caption_only_claim_count = 0
+        local_caption_only_risk_field_claim_count = 0
+        local_caption_only_unsupported_count = 0
 
         for field, pred in pred_by_field.items():
             gold = gold_by_field.get(field)
@@ -250,18 +310,25 @@ class EvidenceVerifier:
                 if gold is not None and gold.get("abstain"):
                     correct_abstains += 1
                 continue
+            evidence_ids = [str(eid) for eid in pred.get("evidence_ids") or []]
+            local_caption_only = bool(evidence_ids) and all(eid.startswith("local_caption_") for eid in evidence_ids)
+            local_caption_risk_field = local_caption_only and field in LOCAL_CAPTION_RISK_FIELDS
+            if local_caption_only:
+                local_caption_only_claim_count += 1
+            if local_caption_risk_field:
+                local_caption_only_risk_field_claim_count += 1
+            supported = False
             if gold is not None and not gold.get("abstain") and evidence_overlap(gold, pred):
                 overlap_ids = overlapping_evidence_ids(gold, pred)
                 if self._evidence_policy_supports_field(field, overlap_ids):
                     supported_count += 1
+                    supported = True
                     if field in CORE_CLAIM_FIELDS:
                         core_supported_count += 1
-                else:
-                    unsupported_count += 1
-                    if field in CORE_CLAIM_FIELDS:
-                        core_unsupported_count += 1
-            else:
+            if not supported:
                 unsupported_count += 1
+                if local_caption_risk_field:
+                    local_caption_only_unsupported_count += 1
                 if field in CORE_CLAIM_FIELDS:
                     core_unsupported_count += 1
 
@@ -276,6 +343,9 @@ class EvidenceVerifier:
             "core_supported_count": core_supported_count,
             "core_unsupported_count": core_unsupported_count,
             "core_field_match_count": core_field_match_count,
+            "local_caption_only_claim_count": local_caption_only_claim_count,
+            "local_caption_only_risk_field_claim_count": local_caption_only_risk_field_claim_count,
+            "local_caption_only_unsupported_count": local_caption_only_unsupported_count,
             "core_supported_rate": core_supported_count / max(1, len(CORE_CLAIM_FIELDS)),
             "core_field_recall": core_field_match_count / max(1, len(CORE_CLAIM_FIELDS)),
             "correct_abstain_count": correct_abstains,
@@ -358,6 +428,42 @@ def claim_field_allowed(field: str, allowed_fields: list[Any]) -> bool:
     normalized = FIELD_ALIASES.get(str(field), str(field))
     allowed = {FIELD_ALIASES.get(str(item), str(item)) for item in allowed_fields}
     return normalized in allowed
+
+
+def field_policy_score(
+    *,
+    finish: bool,
+    crop_success: bool,
+    claim_supported_rate: float,
+    core_supported_bonus: float,
+    opened_recall: float,
+    cited_recall: float,
+    abstain_accuracy: float,
+    invalid_penalty: float,
+    unsupported_penalty: float,
+    core_unsupported_penalty: float,
+    premature_finish_penalty: float,
+) -> float:
+    """Selection score for field/evidence-policy probes.
+
+    This score intentionally avoids rewarding retrieve hits directly. It
+    rewards evidence only after it has been opened or cited in final claims.
+    """
+
+    score = (
+        0.12 * float(finish)
+        + 0.12 * float(crop_success)
+        + 0.30 * claim_supported_rate
+        + 0.16 * core_supported_bonus
+        + 0.14 * min(1.0, opened_recall / 0.20)
+        + 0.18 * min(1.0, cited_recall / 0.20)
+        + 0.06 * abstain_accuracy
+        - 0.10 * invalid_penalty
+        - 0.16 * unsupported_penalty
+        - 0.12 * core_unsupported_penalty
+        - 0.25 * premature_finish_penalty
+    )
+    return max(-1.0, min(1.0, float(score)))
 
 
 def evidence_policy_block_reason(policy: dict[str, Any], field: str) -> str | None:

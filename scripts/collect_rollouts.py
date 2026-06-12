@@ -100,6 +100,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase-aware-mask", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--enforce-tool-mask", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
+        "--reward-mode",
+        choices=["default", "field_policy_probe"],
+        default="default",
+        help="default keeps legacy reward; field_policy_probe weights cited/opened evidence and field-level support.",
+    )
+    parser.add_argument(
+        "--field-policy-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add explicit field/evidence policy hints to rollout prompts and tool-result summaries.",
+    )
+    parser.add_argument(
         "--target-claim-fields",
         default="",
         help="Comma-separated fields required before finish is allowed. Empty means the default 12-field claim card.",
@@ -139,6 +151,7 @@ def main() -> int:
         region_selection_hint=args.region_selection_hint,
         strict_claim_phase_hint=args.strict_claim_phase_hint,
         dynamic_tool_schema=args.dynamic_tool_schema,
+        field_policy_prompt=args.field_policy_prompt,
     )
     policy = QwenVLSftPolicy(
         args.model,
@@ -163,6 +176,8 @@ def main() -> int:
         enforce_tool_mask=args.enforce_tool_mask,
         tool_schema=args.tool_schema,
         target_claim_fields=target_claim_fields,
+        reward_mode=args.reward_mode,
+        field_policy_hints=args.field_policy_prompt,
     )
 
     rollout_records: list[dict[str, Any]] = []
@@ -373,11 +388,17 @@ def summarize_one(
         "retrieved_evidence_hit_count": trajectory_metrics.get("retrieved_evidence_hit_count"),
         "opened_evidence_hit_count": trajectory_metrics.get("opened_evidence_hit_count"),
         "cited_evidence_hit_count": trajectory_metrics.get("cited_evidence_hit_count"),
+        "field_policy_selection_score": trajectory_metrics.get("field_policy_selection_score"),
         "invalid_step_rate": trajectory_metrics.get("invalid_step_rate"),
         "core_supported_count": trajectory_metrics.get("core_supported_count"),
         "core_supported_rate": trajectory_metrics.get("core_supported_rate"),
         "core_field_match_count": trajectory_metrics.get("core_field_match_count"),
         "core_field_recall": trajectory_metrics.get("core_field_recall"),
+        "local_caption_only_claim_count": trajectory_metrics.get("local_caption_only_claim_count"),
+        "local_caption_only_risk_field_claim_count": trajectory_metrics.get(
+            "local_caption_only_risk_field_claim_count"
+        ),
+        "local_caption_only_unsupported_count": trajectory_metrics.get("local_caption_only_unsupported_count"),
     }
 
 
@@ -557,6 +578,8 @@ def build_summary(
             "include_gold_regions": args.include_gold_regions,
             "phase_aware_mask": args.phase_aware_mask,
             "enforce_tool_mask": args.enforce_tool_mask,
+            "reward_mode": args.reward_mode,
+            "field_policy_prompt": args.field_policy_prompt,
             "target_claim_fields": target_claim_fields,
             "target_claim_fields_from_gold": bool(args.target_claim_fields_from_gold),
         },
@@ -647,7 +670,25 @@ def build_summary(
                 int(item.get("trajectory_metrics", {}).get("cited_evidence_hit_count", 0) or 0) for item in records
             )
             / n,
+            "mean_field_policy_selection_score": sum(
+                float(item.get("trajectory_metrics", {}).get("field_policy_selection_score", 0.0)) for item in records
+            )
+            / n,
             "mean_invalid_step_rate": sum(float(item.get("trajectory_metrics", {}).get("invalid_step_rate", 0.0)) for item in records) / n,
+            "mean_local_caption_only_claim_count": sum(
+                int(item.get("trajectory_metrics", {}).get("local_caption_only_claim_count", 0) or 0) for item in records
+            )
+            / n,
+            "mean_local_caption_only_risk_field_claim_count": sum(
+                int(item.get("trajectory_metrics", {}).get("local_caption_only_risk_field_claim_count", 0) or 0)
+                for item in records
+            )
+            / n,
+            "mean_local_caption_only_unsupported_count": sum(
+                int(item.get("trajectory_metrics", {}).get("local_caption_only_unsupported_count", 0) or 0)
+                for item in records
+            )
+            / n,
             "mean_mask_violation_rate": sum(float(item.get("metrics", {}).get("mask_violation_rate", 0.0)) for item in records) / n,
             "mask_violation_task_rate": sum(int(item.get("metrics", {}).get("mask_violation_count", 0) > 0) for item in records) / n,
             "mean_schema_repair_rate": sum(float(item.get("metrics", {}).get("schema_repair_rate", 0.0)) for item in records) / n,
@@ -758,7 +799,11 @@ def write_markdown_report(path: Path, summary: dict[str, Any], records: list[dic
         f"- mean_retrieved_evidence_hit_count: {metrics.get('mean_retrieved_evidence_hit_count', 0.0):.3f}",
         f"- mean_opened_evidence_hit_count: {metrics.get('mean_opened_evidence_hit_count', 0.0):.3f}",
         f"- mean_cited_evidence_hit_count: {metrics.get('mean_cited_evidence_hit_count', 0.0):.3f}",
+        f"- mean_field_policy_selection_score: {metrics.get('mean_field_policy_selection_score', 0.0):.3f}",
         f"- mean_invalid_step_rate: {metrics['mean_invalid_step_rate']:.3f}",
+        f"- mean_local_caption_only_claim_count: {metrics.get('mean_local_caption_only_claim_count', 0.0):.3f}",
+        f"- mean_local_caption_only_risk_field_claim_count: {metrics.get('mean_local_caption_only_risk_field_claim_count', 0.0):.3f}",
+        f"- mean_local_caption_only_unsupported_count: {metrics.get('mean_local_caption_only_unsupported_count', 0.0):.3f}",
         f"- mean_mask_violation_rate: {metrics.get('mean_mask_violation_rate', 0.0):.3f}",
         f"- mask_violation_task_rate: {metrics.get('mask_violation_task_rate', 0.0):.3f}",
         f"- mean_schema_repair_rate: {metrics.get('mean_schema_repair_rate', 0.0):.3f}",
@@ -794,6 +839,8 @@ def write_markdown_report(path: Path, summary: dict[str, Any], records: list[dic
                 f"- evidence_hit_count: {metrics_one.get('evidence_hit_count')}; claim_count: {metrics_one.get('claim_count')}; has_finish_action: {metrics_one.get('has_finish_action')}; has_finish: {metrics_one.get('has_finish')}; premature_finish_count: {metrics_one.get('premature_finish_count')}",
                 f"- trajectory_success: {metrics_one.get('trajectory_success')}; final_reward: {metrics_one.get('final_reward')}; claim_supported_rate: {metrics_one.get('claim_supported_rate')}; evidence_recall: {metrics_one.get('evidence_recall')}",
                 f"- evidence flow: retrieved_recall={metrics_one.get('retrieved_evidence_recall')}; opened_recall={metrics_one.get('opened_evidence_recall')}; cited_recall={metrics_one.get('cited_evidence_recall')}; retrieved_hits={metrics_one.get('retrieved_evidence_hit_count')}; opened_hits={metrics_one.get('opened_evidence_hit_count')}; cited_hits={metrics_one.get('cited_evidence_hit_count')}",
+                f"- field_policy_selection_score: {metrics_one.get('field_policy_selection_score')}",
+                f"- local caption use: local_only={metrics_one.get('local_caption_only_claim_count')}; risk_field={metrics_one.get('local_caption_only_risk_field_claim_count')}; unsupported={metrics_one.get('local_caption_only_unsupported_count')}",
                 f"- mask_violation_count: {metrics_one.get('mask_violation_count')}; mask_violation_rate: {metrics_one.get('mask_violation_rate')}",
                 f"- schema_repair_count: {metrics_one.get('schema_repair_count')}; schema_repair_rate: {metrics_one.get('schema_repair_rate')}; schema_repaired_key_counts: `{json.dumps(metrics_one.get('schema_repaired_key_counts', {}), ensure_ascii=False)}`",
                 f"- process: no_retrieve={metrics_one.get('no_retrieve')}; retrieve_without_external_open={metrics_one.get('retrieve_without_external_open')}; write_before_retrieve={metrics_one.get('write_before_retrieve')}; premature_mask_finish={metrics_one.get('premature_mask_finish')}",

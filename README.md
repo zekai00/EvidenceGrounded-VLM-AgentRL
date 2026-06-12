@@ -136,6 +136,39 @@ Decision:
 
 The lesson is important: rule-like repair data can reduce premature finish and no-retrieve behavior, and C can increase retrieved recall, but none of these branches improve cited evidence recall. The main bottleneck is now final citation and field/evidence policy alignment, not just retrieval.
 
+### Field Policy Prompt/Reward Probe
+
+Report:
+
+`docs/03_实验报告/v1.0.4FieldPolicyPromptRewardProbe报告_20260612_1205.md`
+
+This probe did not train a new model. It used the current best adapter on the first 16 `val_gold_50` tasks with:
+
+- `--field-policy-prompt`
+- `--reward-mode field_policy_probe`
+
+The goal was to stop rewarding retrieve hits by themselves and instead score opened/cited evidence plus field-level claim support.
+
+| Metric | Baseline first16 | Field-policy probe val16 |
+|---|---:|---:|
+| trajectory_success | 0.875 | 1.000 |
+| finish | 0.938 | 1.000 |
+| field_policy_selection_score | 0.710 | 0.743 |
+| claim_supported_rate | 0.661 | 0.823 |
+| opened_evidence_recall | 0.167 | 0.187 |
+| cited_evidence_recall | 0.111 | 0.118 |
+| retrieve_without_external_open_task_rate | 0.3125 | 0.0000 |
+| no_retrieve_task_rate | 0.1875 | 0.3125 |
+| write_before_retrieve_task_rate | 0.1875 | 0.3125 |
+
+Decision:
+
+- Keep this as a promising probe, not the default runtime.
+- Do not run `test_gold_100`.
+- Refine the prompt/mask before scaling to full val50.
+- Counterfactual replay data has been built but not trained:
+  `/root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_0_4_counterfactual_field_policy_replay_20260612_1144`
+
 ## Reproducing Main Evaluation
 
 Baseline val50:
@@ -241,8 +274,8 @@ Large datasets, model weights, and rollout outputs are kept outside git unless e
 
 Recommended next steps:
 
-1. Add cited-evidence and field/evidence-policy pressure to reward/evaluation; do not rely on old merged `mean_evidence_recall` for model selection.
-2. Run a small prompt/reward probe that forces non-caption fields to cite evidence allowed for that field, while keeping local caption valid for caption/title only.
+1. Refine the field-policy prompt/mask so risk fields with only local caption prefer abstain or external open, without increasing no-retrieve/write-before-retrieve.
+2. Re-run a small val16/val24 probe before any full val50 run.
 3. Patch remaining GoldEval caption-boundary candidates such as `001631`, `001602`, and `001887`.
 4. Run a small page-image retrieval probe using ColPali/VisRAG-style retrieval before changing the main evidence index.
 5. Consider GRPO only after `claim_supported_rate` and `cited_evidence_recall` do not regress on `val_gold_50`.
