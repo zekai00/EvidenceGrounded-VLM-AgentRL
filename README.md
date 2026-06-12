@@ -199,6 +199,32 @@ This changes the interpretation of Behavior Repair C: it improves evidence recal
 
 This confirms the field-policy probe is promising but not safe enough to scale: recall improved, while precision dropped. Future selection should prioritize `claim_support_f1`, `claim_support_precision`, `cited_evidence_f1`, and local-caption-only risk diagnostics together.
 
+### Fragment Support Probe
+
+Reports:
+
+`docs/02_指标与数据/v1.0.4GoldFragmentSupportProbe构建与指标说明_20260612.md`
+
+`docs/03_实验报告/v1.0.4GoldFragmentSupportProbe离线回放报告_20260612_1400.md`
+
+A small `v1.0.4_gold_fragment_support_probe` was built on corrected GoldEval val50:
+
+- 420 `(task, field, evidence/fragment)` pairs.
+- 120 LLM-adjudicated labels, 299 rule labels, 1 fallback.
+- Labels: support 120, weak_support 13, no_support 100, wrong_target 187.
+
+Fragment-support replay shows the current blocker is cited field-supporting evidence:
+
+| Metric | Baseline val50 | Behavior Repair C val50 | Field-policy probe val16 |
+|---|---:|---:|---:|
+| claim_support_f1 | 0.443 | 0.450 | 0.386 |
+| cited_evidence_f1 | 0.711 | 0.585 | 0.686 |
+| local_caption_overgeneralization_task_rate | 0.400 | 0.000 | 0.750 |
+| external_open_no_positive_citation_task_rate | 1.000 | 1.000 | 1.000 |
+| wrong_target_citation_rate | 0.008 | 0.000 | 0.032 |
+
+Decision: keep the v1.0.2b adapter as current best. Do not adopt C, and do not make the field-policy probe default. The next improvement should reward external positive citations and penalize local-caption overgeneralization/wrong-target citation.
+
 ## Reproducing Main Evaluation
 
 Baseline val50:
