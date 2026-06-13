@@ -139,6 +139,11 @@ def parse_args() -> argparse.Namespace:
         help="Seconds between nvidia-smi samples. Set <=0 to disable GPU memory logging.",
     )
     parser.add_argument(
+        "--gpu-monitor-indices",
+        default="",
+        help="Optional comma-separated physical GPU indices for nvidia-smi, e.g. 1. Empty queries all GPUs.",
+    )
+    parser.add_argument(
         "--training-record",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -170,7 +175,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     logs_path = output_dir / "train_log.jsonl"
     gpu_monitor_path = output_dir / "gpu_memory_monitor.jsonl"
-    gpu_monitor = start_gpu_monitor(gpu_monitor_path, args.gpu_monitor_interval)
+    gpu_monitor = start_gpu_monitor(gpu_monitor_path, args.gpu_monitor_interval, args.gpu_monitor_indices)
 
     train_rows_all = read_jsonl(Path(args.train_jsonl))
     val_rows_all = read_jsonl(Path(args.val_jsonl)) if args.val_jsonl else []
@@ -308,9 +313,10 @@ def main() -> int:
 
 
 class GpuMemoryMonitor:
-    def __init__(self, output_path: Path, interval: float) -> None:
+    def __init__(self, output_path: Path, interval: float, gpu_indices: str = "") -> None:
         self.output_path = output_path
         self.interval = max(0.5, float(interval))
+        self.gpu_indices = gpu_indices.strip()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="gpu-memory-monitor", daemon=True)
 
@@ -328,14 +334,14 @@ class GpuMemoryMonitor:
                     "time": now(),
                     "timestamp": time.time(),
                     "pid_alive": True,
-                    "gpus": query_nvidia_smi(),
+                    "gpus": query_nvidia_smi(self.gpu_indices),
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
                 self.stop_event.wait(self.interval)
 
 
-def start_gpu_monitor(output_path: Path, interval: float) -> GpuMemoryMonitor | None:
+def start_gpu_monitor(output_path: Path, interval: float, gpu_indices: str = "") -> GpuMemoryMonitor | None:
     if interval <= 0:
         return None
     if shutil.which("nvidia-smi") is None:
@@ -344,17 +350,20 @@ def start_gpu_monitor(output_path: Path, interval: float) -> GpuMemoryMonitor | 
             flush=True,
         )
         return None
-    monitor = GpuMemoryMonitor(output_path, interval)
+    monitor = GpuMemoryMonitor(output_path, interval, gpu_indices)
     monitor.start()
     return monitor
 
 
-def query_nvidia_smi() -> list[dict[str, Any]]:
+def query_nvidia_smi(gpu_indices: str = "") -> list[dict[str, Any]]:
     cmd = [
         "nvidia-smi",
         "--query-gpu=index,name,memory.used,utilization.gpu",
         "--format=csv,noheader,nounits",
     ]
+    if gpu_indices.strip():
+        cmd.insert(1, "-i")
+        cmd.insert(2, gpu_indices.strip())
     try:
         proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except Exception:

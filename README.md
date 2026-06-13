@@ -6,7 +6,7 @@ The current main task is to train and evaluate a vision-language tool-call agent
 
 ## Current Status
 
-Current version: `v1.0.4`
+Current version: `v1.0.5 data/SFT-prep`
 
 Current best configuration:
 
@@ -14,7 +14,24 @@ Current best configuration:
 - Best adapter: `/root/models/evidence_grounded_vlm_agentrl/qwen25vl3b_v1_0_2b_sft3000_from_phase8_20260608_0316/adapter`
 - Runtime: v1.0.4 overlay verifier + `retrieve_evidence.scope` repair + no-select tool schema + phase-aware mask
 - Evidence index: `/root/datasets/evidence_grounded_vlm_agentrl/evidence_index_v1_0_4_llm_overlay_20260611_0222`
-- Trusted evaluation set: `/root/datasets/evidence_grounded_vlm_agentrl/gold_eval_v1_0_4_caption_corrected_20260611_1830`
+- Trusted evaluation set for model selection: `/root/datasets/evidence_grounded_vlm_agentrl/gold_eval_v1_0_4_caption_corrected_20260611_1830/val_gold_50.jsonl`
+- Larger final-check set: `/root/datasets/evidence_grounded_vlm_agentrl/gold_eval_v1_0_4_caption_corrected_test200_20260613_0025/test_gold_200.jsonl` (actual rows: 134)
+- Current Core4 SFT candidate data: `/root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_0_5_auto_repaired_secondpass_sft_20260613_0005`
+
+Latest data update:
+
+- v1.0.5 corrected-caption second-pass repaired VLM-identifiable caption-boundary errors such as `egva_v0_9_fixed_000007` and `egva_v0_9_fixed_000014`.
+- The current SFT candidate has 307 tasks and 3070 SFT rows: train 207 / val 52 / test 48.
+- A page-level VLM hybrid index has been built at `/root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_0_5_hybrid_silver_pagelevel_full_20260613_0725`: 787 hybrid rows over 419 unique PDF pages. The stable SFT-conversion pool is 598 tasks after combining old silver Core4 tasks with page-level `title_like`/`descriptive` detections: train 404 / val 86 / test 108. A slightly wider pool has 631 tasks if `short_caption` is included.
+- `figure_number_only` and `shared_page_caption` samples are not high-confidence title supervision. Use them only for protocol/crop/evidence-flow training with `depicted_work_title` abstention or as hard negatives.
+- Fresh/continued Core4 SFT runs are pending because local CUDA initialization is currently blocked by a GPU0 driver/device-handle failure; GPU1 is visible to `nvidia-smi -i 1`, but PyTorch currently reports `cuda_available=False`.
+
+Remote training note:
+
+- The current SFT script uses `AutoModelForImageTextToText` and `AutoProcessor`, so it is intended for VLM checkpoints such as `/root/models/Qwen2.5-VL-3B-Instruct`, `/root/models/Qwen2.5-VL-7B-Instruct`, `/root/models/Qwen3-VL-4B-Instruct`, `/root/models/Qwen3-VL-8B-Instruct`, `/root/models/Qwen3.5-4B`, and `/root/models/Qwen3.5-9B`.
+- A 24GB RTX 3090 should be sufficient for LoRA/QLoRA SFT on 3B/4B/7B/8B VLMs with `--load-in-4bit`, batch size 1, gradient accumulation, and constrained image pixels.
+- Existing adapters are base-model specific: the current Qwen2.5-VL-3B adapter can only be continued from Qwen2.5-VL-3B. Qwen2.5-VL-7B and Qwen3-VL models require fresh LoRA adapters.
+- Qwen3.5 is not treated here as a text-only model. The local `/root/models/Qwen3.5-4B` and `/root/models/Qwen3.5-9B` configs include `vision_config`, image/video token IDs, and `model_type=qwen3_5`. They should still be smoke-tested with the installed `transformers` version before training, because loader support for newer architectures can lag behind model releases.
 
 This repository is no longer at the early next-action SFT stage. The current bottleneck is not crop quality. On GoldEval, target crop/region selection is already stable. The main bottleneck is field-level claim grounding:
 
