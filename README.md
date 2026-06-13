@@ -28,10 +28,10 @@ Latest data update:
 
 Remote training note:
 
-- The current SFT script uses `AutoModelForImageTextToText` and `AutoProcessor`, so it is intended for VLM checkpoints such as `/root/models/Qwen2.5-VL-3B-Instruct`, `/root/models/Qwen2.5-VL-7B-Instruct`, `/root/models/Qwen3-VL-4B-Instruct`, and `/root/models/Qwen3-VL-8B-Instruct`.
+- The current SFT script uses `AutoModelForImageTextToText` and `AutoProcessor`, so it is intended for VLM checkpoints such as `/root/models/Qwen2.5-VL-3B-Instruct`, `/root/models/Qwen2.5-VL-7B-Instruct`, `/root/models/Qwen3-VL-4B-Instruct`, `/root/models/Qwen3-VL-8B-Instruct`, `/root/models/Qwen3.5-4B`, and `/root/models/Qwen3.5-9B`.
 - A 24GB RTX 3090 should be sufficient for LoRA/QLoRA SFT on 3B/4B/7B/8B VLMs with `--load-in-4bit`, batch size 1, gradient accumulation, and constrained image pixels.
 - Existing adapters are base-model specific: the current Qwen2.5-VL-3B adapter can only be continued from Qwen2.5-VL-3B. Qwen2.5-VL-7B and Qwen3-VL models require fresh LoRA adapters.
-- Plain text models such as `/root/models/Qwen3.5-4B` and `/root/models/Qwen3.5-9B` are not drop-in replacements for the current image-grounded SFT script. They can be used only for text-only ablations or verifier/adjudication utilities unless a separate text-only training path is added.
+- Qwen3.5 is not treated here as a text-only model. The local `/root/models/Qwen3.5-4B` and `/root/models/Qwen3.5-9B` configs include `vision_config`, image/video token IDs, and `model_type=qwen3_5`. They should still be smoke-tested with the installed `transformers` version before training, because loader support for newer architectures can lag behind model releases.
 
 This repository is no longer at the early next-action SFT stage. The current bottleneck is not crop quality. On GoldEval, target crop/region selection is already stable. The main bottleneck is field-level claim grounding:
 
