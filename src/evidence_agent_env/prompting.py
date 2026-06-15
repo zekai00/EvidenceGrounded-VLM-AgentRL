@@ -9,10 +9,18 @@ from typing import Any
 
 
 IMAGE_SIZE_CACHE: dict[str, tuple[int, int]] = {}
-CLAIM_FIELD_SPEC = (
-    "caption_text|image_scope|depicted_work_title|displayed_region|object_type|artist|dynasty|"
-    "visual_elements|technique|composition|medium_dimensions|collection"
-)
+V1_3_1_CLAIM_FIELDS = [
+    "caption_text",
+    "depicted_work_title",
+    "image_scope",
+    "object_type",
+    "creator_or_attribution",
+    "creation_period_or_dynasty",
+    "collection_institution",
+    "dimensions",
+    "medium_material",
+]
+CLAIM_FIELD_SPEC = "|".join(V1_3_1_CLAIM_FIELDS)
 EVIDENCE_POLICY_KEYS = [
     "clean_evidence_type",
     "adjudicated_evidence_role",
@@ -37,6 +45,7 @@ class PromptConfig:
     strict_claim_phase_hint: bool = False
     dynamic_tool_schema: bool = False
     field_policy_prompt: bool = False
+    compact_state_update: bool = False
 
 
 def build_messages_from_observation(
@@ -188,8 +197,8 @@ def field_policy_prompt_lines(obs: dict[str, Any]) -> list[str]:
     return [
         "字段级 evidence policy probe：",
         "1. 每个非 abstain claim 必须引用能够支持该字段的 evidence_id；不能因为一个 evidence 与作品相关，就把它用于所有字段。",
-        "2. local_caption 主要支持 caption_text，以及图注中明确出现的题名、作者、朝代、尺寸、馆藏；不能默认支持 image_scope、displayed_region、object_type。",
-        "3. image_scope/displayed_region/object_type 只有在 evidence 文本明确说明全幅/局部/册页/细部/对象类型时才可写；否则应 retrieve/open 外部 evidence，仍不足则 abstain。",
+        "2. local_caption 主要支持 caption_text，以及图注中明确出现的 depicted_work_title、creator_or_attribution、creation_period_or_dynasty、dimensions、medium_material、collection_institution；不能默认支持 image_scope、object_type。",
+        "3. image_scope/object_type 只有在视觉证据或 evidence 文本明确支持时才可写；否则应 retrieve/open 外部 evidence，仍不足则 abstain。",
         "4. retrieve_evidence 后，如果要用检索结果支持 claim，必须先 open_evidence 读取对应 evidence；不要只检索不打开就写 claim。",
         "当前 remaining_fields："
         + json.dumps(remaining, ensure_ascii=False, separators=(",", ":")),
@@ -262,7 +271,7 @@ def claim_phase_hint(obs: dict[str, Any], config: PromptConfig, current_claim_st
             extra = ""
             if config.field_policy_prompt:
                 extra = (
-                    "对于 image_scope、displayed_region、object_type，如果当前只有 local_caption 且图注没有明确支持，"
+                    "对于 image_scope、object_type，如果当前只有 local_caption 且图注没有明确支持，"
                     "本阶段应对该字段 abstain，不要用 local_caption 硬写。"
                 )
             return (

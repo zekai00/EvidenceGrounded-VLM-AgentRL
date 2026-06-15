@@ -1,337 +1,254 @@
 # EvidenceGrounded-VLM-AgentRL
 
-EvidenceGrounded-VLM-AgentRL is a VLM agentic RL project for evidence-grounded multimodal document understanding.
+EvidenceGrounded-VLM-AgentRL trains a vision-language tool-call agent for evidence-grounded multimodal document understanding.
 
-The current main task is to train and evaluate a vision-language tool-call agent that reads Chinese landscape-painting PDF literature, locates the target artwork image, retrieves/open evidence, and writes structured claims only when the evidence supports them.
+The current task is Chinese landscape-painting literature: given a PDF page, the agent must locate the target artwork image, inspect local caption and page evidence, retrieve/open supporting fragments when needed, write structured fields only when evidence supports them, and abstain when evidence is insufficient.
 
-## Current Status
+The project is now centered on the `v1.3.1` SFT -> RLVR/GRPO route.
 
-Current version: `v1.0.4`
+## Current Route
 
-Current best configuration:
+The current route has three stages:
 
-- Base model: `/root/models/Qwen2.5-VL-3B-Instruct`
-- Best adapter: `/root/models/evidence_grounded_vlm_agentrl/qwen25vl3b_v1_0_2b_sft3000_from_phase8_20260608_0316/adapter`
-- Runtime: v1.0.4 overlay verifier + `retrieve_evidence.scope` repair + no-select tool schema + phase-aware mask
-- Evidence index: `/root/datasets/evidence_grounded_vlm_agentrl/evidence_index_v1_0_4_llm_overlay_20260611_0222`
-- Trusted evaluation set: `/root/datasets/evidence_grounded_vlm_agentrl/gold_eval_v1_0_4_caption_corrected_20260611_1830`
+1. **Remote-VLM data construction**
+   - Use raw PDF pages with visible images.
+   - Run page-level annotation with `qwen3.7-max-2026-06-08`.
+   - Produce `FigureTarget`, `EvidenceFragment`, and `FieldSupportLabel`.
 
-This repository is no longer at the early next-action SFT stage. The current bottleneck is not crop quality. On GoldEval, target crop/region selection is already stable. The main bottleneck is field-level claim grounding:
+2. **SFT for the page/caption/evidence protocol**
+   - Train Qwen2.5-VL-3B LoRA adapters to follow the action schema.
+   - Compare fresh SFT from the base model with continued SFT from the previous best adapter.
+   - Track loss and GPU memory curves for every training run.
 
-- whether each non-abstain claim cites valid `evidence_ids`;
-- whether cited evidence can actually support the claim field;
-- whether the model abstains only when evidence is insufficient;
-- whether final claims remain supported after retrieve/open/write tool use.
+3. **Trajectory-level RLVR / GRPO**
+   - Build executable v1.3.1 tasks from SFT artifacts.
+   - Roll out the agent in an environment with legal action sets and verifier rewards.
+   - Use compact state updates so multi-step rollouts do not exceed response length.
+   - First optimize trajectory-level reward before adding more complex state-level sampling.
 
-## Agent Workflow
+## Main Data Objects
 
-The no-select runtime currently follows this high-level workflow:
+### FigureTarget
+
+A single target figure on a PDF page. It contains the page image, source PDF, page number, target bbox, caption bbox, trajectory type, and gold field values.
+
+### EvidenceFragment
+
+A fragment that can be opened, retrieved, or cited by the agent. Common fragment types include:
+
+- `local_caption_visual`
+- `same_page_body`
+- `visual`
+- `wrong_target_caption`
+
+### FieldSupportLabel
+
+A `(target, field, fragment)` label indicating whether a fragment supports a field value:
+
+- `support`
+- `no_support`
+- `ambiguous`
+- `wrong_target`
+
+These labels are used for SFT data generation, field-support evaluation, and verifier rewards.
+
+## Current v1.3.1 Dataset
+
+The current main SFT dataset is:
 
 ```text
-inspect_page
--> crop_target
--> open_evidence(local_caption)
--> retrieve_evidence, if more evidence is needed
--> open_evidence(retrieved evidence)
--> write_claims_chunk / abstain
--> finish
+/root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_3_1_remote_vlm_evidence_sft_20260614_1335
 ```
 
-This is not a rigid requirement to call every tool exactly once. The key rules are:
+Summary:
 
-- inspect and crop before writing claims;
-- use local caption when it is sufficient;
-- retrieve/open external evidence when non-caption fields need support;
-- every non-abstain claim must include evidence IDs;
-- if evidence is insufficient, abstain instead of guessing;
-- finish only after all target fields are written or abstained.
-
-Current GoldEval target fields are Core5:
-
-```text
-caption_text
-image_scope
-depicted_work_title
-displayed_region
-object_type
-```
-
-## Key Results
-
-### Caption-Corrected GoldEval Baseline
-
-Report:
-
-`docs/03_实验报告/v1.0.4CaptionCorrectedGoldEvalVal50Test100评测与Guard负结果报告_20260611_2301.md`
-
-Baseline val50:
-
-| Metric | Value |
+| Item | Count |
 |---|---:|
-| trajectory_success_rate | 0.960 |
-| finish_rate | 0.980 |
-| premature_finish_task_rate | 0.020 |
-| crop_success_rate | 1.000 |
-| mean_final_reward | 0.898754 |
-| mean_claim_supported_rate | 0.633667 |
-| mean_evidence_recall | 0.493334 |
-| no_retrieve_task_rate | 0.140 |
-| mean_negative_write_claim_count | 1.400 |
+| page records | 1950 |
+| accepted targets | 1804 |
+| evidence fragments | 6044 |
+| field support labels | 16416 |
+| SFT rows | 29993 |
 
-Baseline test100:
+Target split:
 
-| Metric | Value |
+| split | targets |
 |---|---:|
-| trajectory_success_rate | 0.850 |
-| finish_rate | 0.970 |
-| premature_finish_task_rate | 0.030 |
-| crop_success_rate | 1.000 |
-| mean_final_reward | 0.894403 |
-| mean_claim_supported_rate | 0.619000 |
-| mean_evidence_recall | 0.578889 |
-| no_retrieve_task_rate | 0.050 |
-| mean_negative_write_claim_count | 1.910 |
+| train | 1352 |
+| val | 181 |
+| test | 271 |
 
-### Behavior Repair SFT Negative Results
+Trajectory type distribution:
 
-Reports:
-
-`docs/03_实验报告/v1.0.4BehaviorRepairSFT训练评测负结果报告_20260612_0159.md`
-
-`docs/03_实验报告/v1.0.4EvidenceRecall拆分与BehaviorRepairC负结果报告_20260612_0318.md`
-
-Three small LoRA continuation branches were trained from the current best adapter:
-
-- A: patch:replay = 30:70, 20 optimizer steps.
-- B: patch:replay = 40:60, 40 optimizer steps.
-- C: patch:replay = 10:90, positive-majority patch, 20 optimizer steps.
-
-All were evaluated only on `val_gold_50`; `test_gold_100` was not used for selection.
-
-| Metric | Baseline | A replay70 | B replay60 | C pos70 replay90 |
+| type | train | val | test | total |
 |---|---:|---:|---:|---:|
-| trajectory_success_rate | 0.960 | 0.900 | 0.860 | 0.900 |
-| finish_rate | 0.980 | 1.000 | 1.000 | 0.980 |
-| premature_finish_task_rate | 0.020 | 0.000 | 0.000 | 0.000 |
-| mean_final_reward | 0.898754 | 0.824033 | 0.819815 | 0.828528 |
-| mean_claim_supported_rate | 0.633667 | 0.351333 | 0.351333 | 0.359333 |
-| mean_evidence_recall | 0.493334 | 0.544445 | 0.486667 | 0.537778 |
-| mean_negative_write_claim_count | 1.400 | 2.180 | 2.140 | 2.120 |
+| `caption_only` | 402 | 54 | 81 | 537 |
+| `retrieve_needed` | 184 | 25 | 37 | 246 |
+| `abstain_needed` | 631 | 84 | 126 | 841 |
+| `wrong_target_negative` | 135 | 18 | 27 | 180 |
 
-Split evidence recall on val50:
+The current RLVR dataset is generated from the same v1.3.1 artifacts:
 
-| Run | retrieved_recall | opened_recall | cited_recall |
-|---|---:|---:|---:|
-| Baseline | 0.382 | 0.162 | 0.111 |
-| A replay70 | 0.433 | 0.191 | 0.111 |
-| B replay60 | 0.376 | 0.173 | 0.111 |
-| C pos70 replay90 | 0.427 | 0.144 | 0.111 |
-
-Decision:
-
-- Do not adopt A/B/C.
-- Do not run test100 for A/B/C.
-- Keep the v1.0.2b adapter as the current best.
-- Do not continue scaling the same behavior-repair recipe.
-
-The lesson is important: rule-like repair data can reduce premature finish and no-retrieve behavior, and C can increase retrieved recall, but none of these branches improve cited evidence recall. The main bottleneck is now final citation and field/evidence policy alignment, not just retrieval.
-
-### Field Policy Prompt/Reward Probe
-
-Report:
-
-`docs/03_实验报告/v1.0.4FieldPolicyPromptRewardProbe报告_20260612_1205.md`
-
-This probe did not train a new model. It used the current best adapter on the first 16 `val_gold_50` tasks with:
-
-- `--field-policy-prompt`
-- `--reward-mode field_policy_probe`
-
-The goal was to stop rewarding retrieve hits by themselves and instead score opened/cited evidence plus field-level claim support.
-
-| Metric | Baseline first16 | Field-policy probe val16 |
-|---|---:|---:|
-| trajectory_success | 0.875 | 1.000 |
-| finish | 0.938 | 1.000 |
-| field_policy_selection_score | 0.710 | 0.743 |
-| claim_supported_rate | 0.661 | 0.823 |
-| opened_evidence_recall | 0.167 | 0.187 |
-| cited_evidence_recall | 0.111 | 0.118 |
-| retrieve_without_external_open_task_rate | 0.3125 | 0.0000 |
-| no_retrieve_task_rate | 0.1875 | 0.3125 |
-| write_before_retrieve_task_rate | 0.1875 | 0.3125 |
-
-Decision:
-
-- Keep this as a promising probe, not the default runtime.
-- Do not run `test_gold_100`.
-- Refine the prompt/mask before scaling to full val50.
-- Counterfactual replay data has been built but not trained:
-  `/root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_0_4_counterfactual_field_policy_replay_20260612_1144`
-
-### Precision/F1 Metric Update
-
-Report:
-
-`docs/02_指标与数据/v1.0.4PrecisionF1指标补充说明_20260612.md`
-
-The evaluator now reports precision, recall, and F1 for claim support and evidence flow, instead of relying on recall alone.
-
-| Metric | Baseline val50 | Behavior Repair C val50 |
-|---|---:|---:|
-| claim_support_precision | 0.905 | 1.000 |
-| claim_support_recall | 0.634 | 0.359 |
-| claim_support_f1 | 0.687 | 0.520 |
-| evidence_precision | 1.000 | 0.996 |
-| evidence_recall | 0.493 | 0.538 |
-| evidence_f1 | 0.637 | 0.689 |
-| cited_evidence_f1 | 0.200 | 0.200 |
-
-This changes the interpretation of Behavior Repair C: it improves evidence recall/F1 but reduces claim support F1, so it remains a negative result.
-
-| Metric | Baseline first16 | Field-policy probe val16 |
-|---|---:|---:|
-| claim_support_precision | 0.914 | 0.742 |
-| claim_support_recall | 0.661 | 0.823 |
-| claim_support_f1 | 0.713 | 0.730 |
-| opened_evidence_f1 | 0.282 | 0.312 |
-| cited_evidence_f1 | 0.200 | 0.210 |
-
-This confirms the field-policy probe is promising but not safe enough to scale: recall improved, while precision dropped. Future selection should prioritize `claim_support_f1`, `claim_support_precision`, `cited_evidence_f1`, and local-caption-only risk diagnostics together.
-
-### Fragment Support Probe
-
-Reports:
-
-`docs/02_指标与数据/v1.0.4GoldFragmentSupportProbe构建与指标说明_20260612.md`
-
-`docs/03_实验报告/v1.0.4GoldFragmentSupportProbe离线回放报告_20260612_1400.md`
-
-A small `v1.0.4_gold_fragment_support_probe` was built on corrected GoldEval val50:
-
-- 420 `(task, field, evidence/fragment)` pairs.
-- 120 LLM-adjudicated labels, 299 rule labels, 1 fallback.
-- Labels: support 120, weak_support 13, no_support 100, wrong_target 187.
-
-Fragment-support replay shows the current blocker is cited field-supporting evidence:
-
-| Metric | Baseline val50 | Behavior Repair C val50 | Field-policy probe val16 |
-|---|---:|---:|---:|
-| claim_support_f1 | 0.443 | 0.450 | 0.386 |
-| cited_evidence_f1 | 0.711 | 0.585 | 0.686 |
-| local_caption_overgeneralization_task_rate | 0.400 | 0.000 | 0.750 |
-| external_open_no_positive_citation_task_rate | 1.000 | 1.000 | 1.000 |
-| wrong_target_citation_rate | 0.008 | 0.000 | 0.032 |
-
-Decision: keep the v1.0.2b adapter as current best. Do not adopt C, and do not make the field-policy probe default. The next improvement should reward external positive citations and penalize local-caption overgeneralization/wrong-target citation.
-
-## Reproducing Main Evaluation
-
-Baseline val50:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/collect_rollouts.py \
-  --tasks /root/datasets/evidence_grounded_vlm_agentrl/gold_eval_v1_0_4_caption_corrected_20260611_1830/val_gold_50.jsonl \
-  --max-tasks 50 \
-  --evidence-index /root/datasets/evidence_grounded_vlm_agentrl/evidence_index_v1_0_4_llm_overlay_20260611_0222 \
-  --output-dir outputs/v1_0_4_gold_eval_caption_corrected_val50_bf16 \
-  --model /root/models/Qwen2.5-VL-3B-Instruct \
-  --adapter /root/models/evidence_grounded_vlm_agentrl/qwen25vl3b_v1_0_2b_sft3000_from_phase8_20260608_0316/adapter \
-  --max-steps 14 \
-  --tool-schema no_select --phase-aware-mask --enforce-tool-mask \
-  --strict-claim-phase-hint --dynamic-tool-schema \
-  --target-claim-fields-from-gold \
-  --no-load-in-4bit --torch-dtype bf16 \
-  --image-max-pixels 262144 --max-seq-length 14336 --max-new-tokens 256 \
-  --temperature 0.0 --no-print-steps
+```text
+/root/datasets/evidence_grounded_vlm_agentrl/rlvr_v1_3_1_trajectory_level_latest
 ```
 
-Build behavior repair data:
+## Target Fields
 
-```bash
-python scripts/build_v1_0_4_behavior_repair_sft.py \
-  --dataset-suffix C_pos70_replay90 \
-  --replay-ratio 0.90 \
-  --max-patch-train 200 \
-  --max-patch-val 64 \
-  --max-supported-train 140 \
-  --max-abstain-train 20 \
-  --max-boundary-train 20 \
-  --max-finish-train 20 \
-  --max-supported-val 48 \
-  --max-abstain-val 8 \
-  --max-boundary-val 4 \
-  --max-finish-val 4 \
-  --max-replay-rows 2000 \
-  --seed 44
+The current field protocol is BaseLocate4 + Metadata5.
+
+BaseLocate4:
+
+- `caption_text`
+- `depicted_work_title`
+- `image_scope`
+- `object_type`
+
+Metadata5:
+
+- `creator_or_attribution`
+- `creation_period_or_dynasty`
+- `collection_institution`
+- `dimensions`
+- `medium_material`
+
+Caption, page vision, page body text, and retrieved fragments are treated as different evidence sources. Metadata fields are retrieved only when local caption evidence is insufficient.
+
+## Action Schema
+
+The current executable RLVR environment uses this compact action set:
+
+- `inspect_page`: inspect page image, candidate regions, and visible evidence ids.
+- `crop_target`: crop the target figure or a candidate target region.
+- `retrieve_evidence`: search same-page, same-document, or corpus evidence.
+- `open_evidence`: open a visible or retrieved evidence fragment.
+- `write_claim`: write one supported field value with evidence ids.
+- `abstain_claim`: abstain one field when evidence is insufficient.
+- `write_claims_chunk`: write or abstain a small chunk of fields.
+- `finish`: end only after required fields are written or abstained.
+
+The model must output exactly one JSON action per step.
+
+## Current RLVR/GRPO Setup
+
+The v1.3.1 GRPO smoke path uses:
+
+- Base model: Qwen2.5-VL-3B-Instruct
+- Initial adapter: v1.3.1 B-continued SFT adapter
+- Reward level: trajectory-level
+- Actor strategy: FSDP1 across 4 GPUs
+- Rollout: vLLM async, `tensor_model_parallel_size=1`
+- Compact state update: enabled
+
+Latest 4GPU 5-step smoke:
+
+```text
+outputs/v1_3_1_trajectory_grpo_smoke_compact_footerfix_repair_4gpu_5step_20260615_1940
 ```
 
-Train a continuation LoRA branch:
+Observed smoke result:
 
-```bash
-python scripts/train_trajectory_sft_lora.py \
-  --train-jsonl /root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_0_4_behavior_repair_sft_C_pos70_replay90_20260612_0221/sft/train.jsonl \
-  --val-jsonl /root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_0_4_behavior_repair_sft_C_pos70_replay90_20260612_0221/sft/val.jsonl \
-  --output-dir /root/models/evidence_grounded_vlm_agentrl/qwen25vl3b_v1_0_4_behavior_repair_C_pos70_replay90_20step \
-  --model /root/models/Qwen2.5-VL-3B-Instruct \
-  --adapter /root/models/evidence_grounded_vlm_agentrl/qwen25vl3b_v1_0_2b_sft3000_from_phase8_20260608_0316/adapter \
-  --epochs 0.08 \
-  --batch-size 1 \
-  --gradient-accumulation-steps 8 \
-  --learning-rate 1e-5 \
-  --prompt-mode compact \
-  --max-val-rows 64 \
-  --load-in-4bit --torch-dtype bf16 \
-  --training-record
-```
+- 40 train rollouts
+- prompt/response clip ratio: `0.0`
+- actor allocated memory: about `10.55GB`
+- actor reserved memory: about `10.83GB`
+- checkpoint saved at `global_step_5/actor`
 
-Training automatically records:
-
-- `train_log.jsonl`
-- `gpu_memory_monitor.jsonl`
-- `训练记录.md`
-- `training_assets/loss_curve.png`
-- `training_assets/gpu_memory_curve.png`
-
-## Documentation
-
-Important docs:
-
-- `docs/codex-worklog.md`
-- `docs/01_规划与路线/`
-- `docs/02_指标与数据/`
-- `docs/03_实验报告/`
-- `docs/04_阶段性总结/`
-- `docs/05_相关资料/`
-
-Recent related-paper digest:
-
-`docs/05_相关资料/v1.0.4相关论文与实现导读_20260611.md`
-
-Note: `docs/` is treated as a local/internal report directory in `.gitignore`. The public GitHub repository tracks the runnable code and README; local reports and downloaded PDFs stay in the working machine unless explicitly force-added.
+This smoke verifies that the 4GPU RLVR/GRPO path runs end to end. It is not yet a convergence result.
 
 ## Repository Layout
 
 ```text
-configs/     Experiment configuration
-docs/        Chinese reports, metrics notes, related papers, and worklog
-scripts/     Data construction, training, and evaluation scripts
-src/         Environment, tools, verifier, prompting, and agent modules
+configs/verl/                         Verl AgentLoop configs
+scripts/build_v1_3_remote_vlm_evidence_sft.py
+scripts/build_v1_3_1_rlvr_trajectory_level.py
+scripts/run_verl_v1_3_1_trajectory_grpo_smoke.sh
+scripts/eval_trajectory_sft_actions.py
+scripts/train_trajectory_sft_lora.py
+src/evidence_agent_env/               Executable agent environment
+src/evidence_agent_env/verl_stepwise_agent_loop.py
 ```
 
-Large datasets, model weights, and rollout outputs are kept outside git unless explicitly documented. The local dataset/model roots used by this project are:
+Large datasets, model weights, outputs, and internal reports are intentionally kept outside the public repository or ignored by Git.
+
+## Build RLVR Data
+
+```bash
+python scripts/build_v1_3_1_rlvr_trajectory_level.py \
+  --dataset-dir /root/datasets/evidence_grounded_vlm_agentrl/agentbench_v1_3_1_remote_vlm_evidence_sft_20260614_1335 \
+  --output-root /root/datasets/evidence_grounded_vlm_agentrl \
+  --latest-link rlvr_v1_3_1_trajectory_level_latest
+```
+
+This writes:
 
 ```text
-/root/datasets/evidence_grounded_vlm_agentrl
-/root/models/evidence_grounded_vlm_agentrl
+/root/datasets/evidence_grounded_vlm_agentrl/rlvr_v1_3_1_trajectory_level_YYYYMMDD_HHMM
+/root/datasets/evidence_grounded_vlm_agentrl/rlvr_v1_3_1_trajectory_level_latest
 ```
 
-## Next Work
+## Run a 4GPU GRPO Smoke
 
-Recommended next steps:
+Example for the current local machine:
 
-1. Refine the field-policy prompt/mask and select by claim/evidence precision-F1, not recall alone.
-2. Re-run a small val16/val24 probe before any full val50 run.
-3. Patch remaining GoldEval caption-boundary candidates such as `001631`, `001602`, and `001887`.
-4. Run a small page-image retrieval probe using ColPali/VisRAG-style retrieval before changing the main evidence index.
-5. Consider GRPO only after `claim_supported_rate` and `cited_evidence_recall` do not regress on `val_gold_50`.
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+N_GPUS_PER_NODE=4 \
+TRAIN_MAX_SAMPLES=10 \
+VAL_MAX_SAMPLES=4 \
+TOTAL_TRAINING_STEPS=5 \
+SAVE_FREQ=5 \
+TEST_FREQ=5 \
+TRAIN_BATCH_SIZE=2 \
+ROLLOUT_N=4 \
+PPO_MINI_BATCH_SIZE=2 \
+PPO_MICRO_BATCH_SIZE_PER_GPU=1 \
+LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=1 \
+MAX_RESPONSE_LENGTH=4096 \
+MAX_MODEL_LEN=12288 \
+MAX_NUM_BATCHED_TOKENS=12288 \
+MAX_NUM_SEQS=4 \
+ROLLOUT_GPU_MEMORY_UTILIZATION=0.65 \
+MM_PROCESSOR_CACHE_GB=6 \
+AGENT_NUM_WORKERS=4 \
+bash scripts/run_verl_v1_3_1_trajectory_grpo_smoke.sh
+```
+
+The launcher can also run on a mirrored remote layout by overriding:
+
+```bash
+VLM_ROOT=/root/lzk/vlm \
+PROJECT_DIR=/root/lzk/vlm/code/EvidenceGrounded-VLM-AgentRL \
+MODEL_ROOT=/root/lzk/vlm/models \
+DATASETS_ROOT=/root/lzk/vlm/datasets \
+OUTPUT_ROOT=/root/lzk/vlm/outputs \
+bash scripts/run_verl_v1_3_1_trajectory_grpo_smoke.sh
+```
+
+## Metrics
+
+The main evaluation metrics are:
+
+- `trajectory_final_field_f1`: final field set correctness after the full rollout.
+- `support_correct_rate`: written fields supported by cited evidence.
+- `abstain_f1`: evidence-insufficient fields abstained correctly.
+- `target_bbox_iou_ge_05`: target localization quality.
+- `wrong_target_rate`: wrong-neighbor target or wrong evidence usage.
+- `finish_rate`: whether the rollout reaches a valid finish.
+- `invalid_json_rate` / `valid_action_rate`: executable action quality.
+- `schema_repair_rate`: how often the environment had to patch minor argument slips.
+
+Strict next-action metrics such as exact JSON action match are useful diagnostics, but they are not the primary measure of final agent quality.
+
+## Safety and Git Hygiene
+
+Do not commit:
+
+- `.env` or API keys
+- remote server passwords
+- model weights or adapters
+- raw PDFs or page images
+- large `outputs/`
+- private internal reports unless intentionally force-added
+
+The public README describes the project route and code entry points; internal experiment reports live under local `docs/` and are ignored by default.

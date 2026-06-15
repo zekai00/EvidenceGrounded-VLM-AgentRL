@@ -16,6 +16,11 @@ CLAIM_FIELDS = {
     "depicted_work_title",
     "displayed_region",
     "object_type",
+    "creator_or_attribution",
+    "creation_period_or_dynasty",
+    "collection_institution",
+    "dimensions",
+    "medium_material",
     "artist",
     "dynasty",
     "visual_elements",
@@ -31,8 +36,15 @@ CORE_CLAIM_FIELDS = {
     "caption_text",
     "image_scope",
     "depicted_work_title",
-    "displayed_region",
     "object_type",
+}
+
+METADATA5_CLAIM_FIELDS = {
+    "creator_or_attribution",
+    "creation_period_or_dynasty",
+    "collection_institution",
+    "dimensions",
+    "medium_material",
 }
 
 LOCAL_CAPTION_RISK_FIELDS = {
@@ -55,6 +67,10 @@ NO_CLAIM_EVIDENCE_ROLES = {
 
 FIELD_ALIASES = {
     "title": "depicted_work_title",
+    "artist": "creator_or_attribution",
+    "dynasty": "creation_period_or_dynasty",
+    "collection": "collection_institution",
+    "medium_dimensions": "dimensions",
 }
 
 

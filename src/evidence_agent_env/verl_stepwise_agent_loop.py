@@ -50,6 +50,7 @@ class EvidenceStepwiseAgentLoop(AgentLoopBase):
             region_selection_hint=bool(prompt_config.get("region_selection_hint", True)),
             strict_claim_phase_hint=bool(prompt_config.get("strict_claim_phase_hint", True)),
             dynamic_tool_schema=bool(prompt_config.get("dynamic_tool_schema", False)),
+            compact_state_update=bool(prompt_config.get("compact_state_update", False)),
         )
         self.state_update_chars = int(prompt_config.get("state_update_chars", kwargs.get("state_update_chars", 900)))
         self.max_action_tokens = int(prompt_config.get("max_action_tokens", kwargs.get("max_action_tokens", 128)))
@@ -105,6 +106,7 @@ class EvidenceStepwiseAgentLoop(AgentLoopBase):
         response_logprobs: list[float] = []
         step_rewards: list[float] = []
         step_actions: list[str] = []
+        schema_repair_penalty_total = 0.0
         terminated = False
         invalid_streak = 0
 
@@ -143,6 +145,7 @@ class EvidenceStepwiseAgentLoop(AgentLoopBase):
                 break
             raw_text = self.tokenizer.decode(raw_generated_ids, skip_special_tokens=True).strip()
             action, action_text = parse_first_action(raw_text)
+            action = repair_action_for_current_state(action, obs)
             if action_text:
                 action_ids = self.tokenizer.encode(action_text + "\n", add_special_tokens=False)
             else:
@@ -158,6 +161,15 @@ class EvidenceStepwiseAgentLoop(AgentLoopBase):
 
             with simple_timer("tool_calls", metrics):
                 obs, reward, terminated, info = env.step(action if action is not None else raw_text)
+            repair_keys = list(action.get("_agentloop_repaired_keys") or []) if isinstance(action, dict) else []
+            if repair_keys:
+                penalty = min(0.20, 0.10 * len(repair_keys))
+                reward = float(reward) - penalty
+                schema_repair_penalty_total += penalty
+                result_for_penalty = info.get("result") if isinstance(info, dict) else None
+                if isinstance(result_for_penalty, dict):
+                    result_for_penalty["_agentloop_repaired_keys"] = repair_keys
+                    result_for_penalty["_agentloop_repair_penalty"] = penalty
             step_rewards.append(float(reward))
             result = info.get("result") if isinstance(info, dict) else {}
             if action is None or (isinstance(result, dict) and result.get("error")):
@@ -216,6 +228,7 @@ class EvidenceStepwiseAgentLoop(AgentLoopBase):
 
         trajectory_metrics = env.trajectory_metrics()
         score = shaped_trajectory_score(trajectory_metrics)
+        score = max(-1.0, min(1.0, score - schema_repair_penalty_total))
         metrics_obj = AgentLoopMetrics(
             generate_sequences=float(metrics.get("generate_sequences", 0.0)),
             tool_calls=float(metrics.get("tool_calls", 0.0)),
@@ -229,6 +242,7 @@ class EvidenceStepwiseAgentLoop(AgentLoopBase):
             "trajectory_metrics": trajectory_metrics,
             "trajectory_output_dir": str(output_dir),
             "terminated": terminated,
+            "schema_repair_penalty_total": schema_repair_penalty_total,
         }
         return AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -317,6 +331,74 @@ def parse_first_action(text: str) -> tuple[dict[str, Any] | None, str | None]:
     return None, None
 
 
+def repair_action_for_current_state(action: dict[str, Any] | None, obs: dict[str, Any]) -> dict[str, Any] | None:
+    """Patch narrow argument omissions for an otherwise valid current action.
+
+    The generated text remains unchanged for policy-gradient tokens; this only
+    keeps the executable environment from ending a rollout after a recoverable
+    schema slip such as {"action":"crop_target","top_k":1}.
+    """
+
+    if not isinstance(action, dict):
+        return action
+    allowed = set(obs.get("available_actions") or [])
+    name = str(action.get("action") or "")
+    if name not in allowed:
+        return action
+    repaired = dict(action)
+    repaired_keys = list(repaired.get("_agentloop_repaired_keys") or [])
+    reasons = list(repaired.get("_agentloop_repair_reasons") or [])
+    if name == "crop_target" and not repaired.get("region_id") and not repaired.get("bbox"):
+        region_id = preferred_region_id_from_obs(obs)
+        if region_id:
+            repaired["region_id"] = region_id
+            repaired_keys.append("region_id")
+            reasons.append("missing crop_target.region_id")
+    elif name == "open_evidence" and not repaired.get("evidence_id"):
+        alias_id = str(repaired.get("id") or repaired.get("evidence") or "").strip()
+        evidence_ids = [str(item) for item in (obs.get("visible_evidence_ids") or []) if str(item)]
+        if alias_id and alias_id in evidence_ids:
+            repaired["evidence_id"] = alias_id
+            repaired_keys.append("evidence_id")
+            reasons.append("open_evidence id alias")
+        elif evidence_ids:
+            repaired["evidence_id"] = evidence_ids[0]
+            repaired_keys.append("evidence_id")
+            reasons.append("missing open_evidence.evidence_id")
+    elif name == "retrieve_evidence":
+        if not repaired.get("query"):
+            repaired["query"] = default_retrieve_query_from_obs(obs)
+            repaired_keys.append("query")
+            reasons.append("missing retrieve_evidence.query")
+        if not repaired.get("scope"):
+            repaired["scope"] = "same_document"
+            repaired_keys.append("scope")
+            reasons.append("missing retrieve_evidence.scope")
+        if repaired.get("top_k") is None:
+            repaired["top_k"] = 5
+            repaired_keys.append("top_k")
+            reasons.append("missing retrieve_evidence.top_k")
+    if repaired_keys:
+        repaired["_agentloop_repaired_keys"] = repaired_keys
+        repaired["_agentloop_repair_reasons"] = reasons
+    return repaired
+
+
+def preferred_region_id_from_obs(obs: dict[str, Any]) -> str | None:
+    regions = slim_regions(obs.get("regions") or [], snippet_chars=0, max_items=1)
+    if regions and regions[0].get("region_id"):
+        return str(regions[0]["region_id"])
+    region_ids = [str(item) for item in (obs.get("available_region_ids") or []) if str(item)]
+    return region_ids[0] if region_ids else None
+
+
+def default_retrieve_query_from_obs(obs: dict[str, Any]) -> str:
+    goal = obs.get("goal")
+    if isinstance(goal, str) and goal.strip():
+        return short_text(goal, 80) or "图注 作品 作者 年代 馆藏"
+    return "图注 作品 作者 年代 馆藏"
+
+
 def should_auto_finish(obs: dict[str, Any]) -> bool:
     mask = obs.get("tool_mask") if isinstance(obs.get("tool_mask"), dict) else {}
     available = list(obs.get("available_actions") or [])
@@ -391,45 +473,50 @@ def build_state_update_text(
     phase_rule = ""
     remaining_fields = claim_state.get("remaining_fields") or []
     if phase in {"claim_ready", "claim_continuation"}:
-        phase_rule = (
-            "当前处于 claim 写入阶段；除非 remaining_fields 为空，否则必须继续写完或 abstain 剩余字段，"
-            "不要 retrieve/open/propose/crop，不要空输出。每次只写 1 个字段，避免长 JSON。"
-        )
+        phase_rule = "write or abstain one missing field; no retrieve/open/crop; finish only when no missing fields"
         if remaining_fields:
-            phase_rule += (
-                " 如果某个剩余字段没有可靠证据，用 write_claims_chunk 的 abstains 或 abstain_claim。"
-                " 示例：{\"action\":\"write_claims_chunk\",\"claims\":[],\"abstains\":[{\"field\":\""
-                + str(remaining_fields[0])
-                + "\",\"reason\":\"证据不足，无法可靠判断该字段\"}]}。"
-            )
+            phase_rule += f"; next_missing={remaining_fields[0]}"
     elif phase in {"region_selection"}:
-        phase_rule = (
-            "当前处于目标区域裁剪阶段；必须从 available_region_ids 中选择一个 region_id 执行 crop_target；"
-            "优先选择 type=figure_candidate 的大图像区域，不要选择正文或页眉页脚；不要 retrieve/open/write/select_evidence，不要空输出。"
-            "示例：{\"action\":\"crop_target\",\"region_id\":\"r0\"}。"
-        )
+        phase_rule = "crop one region_id from regions/region_ids; prefer figure_candidate/target_rank; no evidence/write/finish"
     elif phase and str(phase).startswith("evidence"):
-        phase_rule = "当前处于证据阶段；根据 allowed action 做 retrieve/open/select；证据足够后进入 write_claims_chunk，每次只写 1 个字段。"
-    text = format_state_update_text(state, phase_rule)
+        phase_rule = "retrieve/open evidence from allowed ids; when evidence is enough, write one field"
+    formatter = format_compact_state_update_text if config.compact_state_update else format_state_update_text
+    text = formatter(state, phase_rule)
     if len(text) <= max_chars:
         return text
     state["last_tool_result"] = slim_tool_result(recent_result_raw, snippet_chars=40, max_items=2)
     if include_full_regions:
         state["available_regions"] = slim_regions(obs.get("regions") or [], snippet_chars=30, max_items=max_state_regions)
     state["visible_evidence_ids"] = (obs.get("visible_evidence_ids") or [])[:5]
-    text = format_state_update_text(state, phase_rule)
+    text = formatter(state, phase_rule)
     if len(text) <= max_chars:
         return text
     state["last_tool_result"] = slim_tool_result(recent_result_raw, snippet_chars=20, max_items=1)
     if include_full_regions:
         state["available_regions"] = slim_regions(obs.get("regions") or [], snippet_chars=0, max_items=max_state_regions)
-    text = format_state_update_text(state, phase_rule)
+    text = formatter(state, phase_rule)
     if len(text) <= max_chars:
         return text
     state["last_tool_result"] = {"tool": recent_result_raw.get("tool")} if isinstance(recent_result_raw, dict) else None
     if include_full_regions:
         state["available_regions"] = slim_regions(obs.get("regions") or [], snippet_chars=0, max_items=max_state_regions)
-    return format_state_update_text(state, phase_rule)
+    text = formatter(state, phase_rule)
+    if len(text) <= max_chars or not config.compact_state_update or not include_full_regions:
+        return text
+    for keep in [6, 4, 2]:
+        state["available_regions"] = slim_regions(
+            obs.get("regions") or [],
+            snippet_chars=0,
+            max_items=min(keep, max_state_regions),
+        )
+        text = formatter(state, phase_rule)
+        if len(text) <= max_chars:
+            return text
+    state["available_regions"] = []
+    ranked_regions = slim_regions(obs.get("regions") or [], snippet_chars=0, max_items=min(6, max_state_regions))
+    ranked_ids = [item.get("region_id") for item in ranked_regions if item.get("region_id")]
+    state["available_region_ids"] = ranked_ids or (obs.get("available_region_ids") or [])[: min(6, max_state_regions)]
+    return formatter(state, phase_rule)
 
 
 def format_state_update_text(state: dict[str, Any], phase_rule: str) -> str:
@@ -440,6 +527,58 @@ def format_state_update_text(state: dict[str, Any], phase_rule: str) -> str:
         + json.dumps(state, ensure_ascii=False, separators=(",", ":"))
         + "\n继续执行，只输出一个 JSON 对象。\n"
     )
+
+
+def format_compact_state_update_text(state: dict[str, Any], phase_rule: str) -> str:
+    claim_state = state.get("claim_state") if isinstance(state.get("claim_state"), dict) else {}
+    regions = state.get("available_regions") or []
+    compact = drop_empty_state_items({
+        "step": state.get("step"),
+        "phase": state.get("phase"),
+        "allowed": state.get("available_actions") or [],
+        "rule": phase_rule,
+        "last": state.get("last_action"),
+        "reward": state.get("last_reward"),
+        "result": compact_last_result_for_state(state.get("last_tool_result")),
+        "regions": regions,
+        "region_ids": [] if regions else (state.get("available_region_ids") or []),
+        "evidence_ids": state.get("visible_evidence_ids") or [],
+        "selected": state.get("selected_evidence_ids") or [],
+        "crop": state.get("last_crop"),
+        "claim": {
+            "written": claim_state.get("written_fields") or [],
+            "abstained": claim_state.get("abstained_fields") or [],
+            "missing": claim_state.get("remaining_fields") or [],
+        },
+    })
+    return (
+        "\n\n[STATE]\n"
+        + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        + "\nNext: output exactly one JSON action from allowed. Use finish only if allowed and claim.missing is empty.\n"
+    )
+
+
+def compact_last_result_for_state(result: Any) -> Any:
+    if not isinstance(result, dict):
+        return result
+    tool = result.get("tool")
+    if tool in {"propose_regions", "inspect_page"} and result.get("regions"):
+        return {"tool": tool, "region_count": len(result.get("regions") or [])}
+    return result
+
+
+def drop_empty_state_items(value: Any) -> Any:
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            slim = drop_empty_state_items(item)
+            if slim is None or slim == [] or slim == {}:
+                continue
+            out[key] = slim
+        return out
+    if isinstance(value, list):
+        return [drop_empty_state_items(item) for item in value]
+    return value
 
 
 def slim_tool_result(result: Any, *, snippet_chars: int, max_items: int) -> Any:
@@ -520,7 +659,16 @@ def slim_tool_result(result: Any, *, snippet_chars: int, max_items: int) -> Any:
 
 def slim_regions(regions: list[Any], *, snippet_chars: int, max_items: int) -> list[dict[str, Any]]:
     slimmed: list[dict[str, Any]] = []
-    for item in regions[: max(0, max_items)]:
+    ordered = sorted(
+        enumerate(regions),
+        key=lambda pair: (
+            int(pair[1].get("target_region_rank") or 999) if isinstance(pair[1], dict) else 999,
+            -float(pair[1].get("target_caption_match_score") or 0.0) if isinstance(pair[1], dict) else 0.0,
+            -float(pair[1].get("caption_link_score") or 0.0) if isinstance(pair[1], dict) else 0.0,
+            pair[0],
+        ),
+    )
+    for _, item in ordered[: max(0, max_items)]:
         if not isinstance(item, dict):
             continue
         slim: dict[str, Any] = {
@@ -529,6 +677,12 @@ def slim_regions(regions: list[Any], *, snippet_chars: int, max_items: int) -> l
             "type": item.get("type"),
             "caption_evidence_id": item.get("caption_evidence_id"),
         }
+        if item.get("target_region_rank") is not None:
+            slim["rank"] = item.get("target_region_rank")
+        if item.get("target_caption_match_score") is not None:
+            slim["match"] = item.get("target_caption_match_score")
+        if item.get("caption_link_score") is not None:
+            slim["link"] = item.get("caption_link_score")
         if snippet_chars > 0:
             hint = item.get("caption_hint") or item.get("nearby_text") or item.get("hint")
             slim["hint"] = short_text(hint, snippet_chars)

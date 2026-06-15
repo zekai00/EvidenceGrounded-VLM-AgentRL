@@ -5,7 +5,19 @@ from __future__ import annotations
 from typing import Any
 
 
-DEFAULT_CLAIM_FIELDS = [
+V1_3_1_CLAIM_FIELDS = [
+    "caption_text",
+    "depicted_work_title",
+    "image_scope",
+    "object_type",
+    "creator_or_attribution",
+    "creation_period_or_dynasty",
+    "collection_institution",
+    "dimensions",
+    "medium_material",
+]
+
+LEGACY_CLAIM_FIELDS = [
     "caption_text",
     "image_scope",
     "depicted_work_title",
@@ -19,6 +31,8 @@ DEFAULT_CLAIM_FIELDS = [
     "medium_dimensions",
     "collection",
 ]
+
+DEFAULT_CLAIM_FIELDS = V1_3_1_CLAIM_FIELDS
 
 
 def normalize_confidence(value: Any) -> float:
