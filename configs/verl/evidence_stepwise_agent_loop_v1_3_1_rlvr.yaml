@@ -1,0 +1,33 @@
+- name: evidence_stepwise_agent
+  _target_: evidence_agent_env.verl_stepwise_agent_loop.EvidenceStepwiseAgentLoop
+  prompt_config:
+    max_history_actions: 8
+    max_tool_results: 5
+    max_evidence_per_result: 3
+    snippet_chars: 120
+    max_text_chars: 8000
+    head_text_chars: 2200
+    coordinate_info: true
+    tool_schema: no_select
+    compact_claim_state: true
+    region_selection_hint: true
+    strict_claim_phase_hint: true
+    dynamic_tool_schema: false
+    compact_state_update: true
+    state_update_chars: 900
+    max_action_tokens: 128
+    max_claim_action_tokens: 640
+    tool_image_max_pixels: 65536
+    target_claim_fields:
+      - caption_text
+      - depicted_work_title
+      - image_scope
+      - object_type
+      - creator_or_attribution
+      - creation_period_or_dynasty
+      - collection_institution
+      - dimensions
+      - medium_material
+  include_tool_images: true
+  max_state_regions: 8
+  auto_finish: true

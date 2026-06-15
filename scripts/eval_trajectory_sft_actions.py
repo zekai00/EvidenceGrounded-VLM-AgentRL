@@ -8,6 +8,7 @@ import json
 import random
 import re
 import sys
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,11 @@ ALLOWED_ACTIONS = {
     "abstain_claim",
     "write_claims_chunk",
     "write_claims_batch",
+    "localize_target",
+    "open_fragment",
+    "retrieve_fragments",
+    "write_field_value",
+    "abstain_field",
     "finish",
 }
 CLAIM_FIELD_SPEC = (
@@ -56,6 +62,11 @@ REQUIRED_KEYS: dict[str, set[str]] = {
     "abstain_claim": {"field", "reason"},
     "write_claims_chunk": {"claims"},
     "write_claims_batch": {"claims"},
+    "localize_target": {"target_bbox_norm1000"},
+    "open_fragment": {"fragment_id"},
+    "retrieve_fragments": {"query", "scope", "top_k"},
+    "write_field_value": {"field", "value", "evidence_ids", "confidence"},
+    "abstain_field": {"field", "reason"},
     "finish": set(),
 }
 
@@ -211,11 +222,16 @@ class Metrics:
         self.counts["exact_match"] += int(result["exact_match"])
         self.counts["field_match"] += int(result["field_match"])
         self.counts["evidence_overlap"] += int(result["evidence_overlap"])
+        self.counts["semantic_action_match"] += int(result["semantic_action_match"])
         self.counts["scope_match"] += int(result["scope_match"])
         self.counts["bbox_iou_ge_05"] += int(result["bbox_iou"] >= 0.5)
-        if gold_type == "retrieve_evidence":
+        if gold_type == "write_field_value":
+            self.denoms["write_field_value"] += 1
+            self.counts["write_value_equiv"] += int(result["value_equiv"])
+            self.counts["write_field_value_semantic"] += int(result["write_field_value_semantic"])
+        if gold_type in {"retrieve_evidence", "retrieve_fragments"}:
             self.denoms["retrieve_evidence"] += 1
-        if gold_type == "crop_image":
+        if gold_type in {"crop_image", "crop_target"} and gold.get("bbox"):
             self.denoms["crop_image"] += 1
         if gold_type in {
             "write_claim",
@@ -229,6 +245,11 @@ class Metrics:
             "crop_region",
             "propose_regions",
             "inspect_page",
+            "localize_target",
+            "open_fragment",
+            "retrieve_fragments",
+            "write_field_value",
+            "abstain_field",
             "finish",
         }:
             self.denoms["field_comparable"] += 1
@@ -248,6 +269,9 @@ class Metrics:
             "exact_match",
             "field_match",
             "evidence_overlap",
+            "semantic_action_match",
+            "value_equiv",
+            "write_field_value_semantic",
             "scope_match",
             "bbox_iou_ge_05",
         ]:
@@ -266,6 +290,7 @@ class Metrics:
             "valid_action_rate": self.rate("valid_action"),
             "action_type_acc": self.rate("action_type_match"),
             "exact_action_acc": self.rate("exact_match"),
+            "semantic_action_acc": self.rate("semantic_action_match"),
         }
 
     def summary(self) -> dict[str, Any]:
@@ -280,6 +305,8 @@ class Metrics:
             "required_keys_rate": self.rate("required_keys_match"),
             "field_acc": self.rate("field_match"),
             "evidence_overlap_rate": self.rate("evidence_overlap"),
+            "write_value_equiv_rate": self.counts["write_value_equiv"] / max(1, self.denoms["write_field_value"]),
+            "write_field_value_semantic_acc": self.counts["write_field_value_semantic"] / max(1, self.denoms["write_field_value"]),
             "scope_acc_on_retrieve": self.counts["scope_match"] / max(1, self.denoms["retrieve_evidence"]),
             "bbox_iou_ge_05_on_crop": self.counts["bbox_iou_ge_05"] / max(1, self.denoms["crop_image"]),
             "bbox_iou_mean": sum(self.bbox_ious) / max(1, len(self.bbox_ious)),
@@ -304,11 +331,27 @@ def score_prediction(gold: dict[str, Any], pred: dict[str, Any] | None) -> dict[
     exact_match = canonical_action(gold) == canonical_action(pred) if isinstance(pred, dict) else False
     field_match = action_type_match and compare_field(gold, pred)
     evidence_overlap = action_type_match and compare_evidence_ids(gold, pred)
-    scope_match = action_type_match and gold_type == "retrieve_evidence" and gold.get("scope") == pred.get("scope")
-    if gold_type != "retrieve_evidence":
+    value_equiv = action_type_match and compare_value(gold, pred)
+    write_field_value_semantic = (
+        action_type_match
+        and gold_type == "write_field_value"
+        and field_match
+        and value_equiv
+        and evidence_overlap
+    )
+    semantic_action_match = semantic_action_correct(
+        gold=gold,
+        pred=pred,
+        action_type_match=bool(action_type_match),
+        field_match=bool(field_match),
+        evidence_overlap=bool(evidence_overlap),
+        value_equiv=bool(value_equiv),
+    )
+    scope_match = action_type_match and gold_type in {"retrieve_evidence", "retrieve_fragments"} and gold.get("scope") == pred.get("scope")
+    if gold_type not in {"retrieve_evidence", "retrieve_fragments"}:
         scope_match = False
     bbox_iou = -1.0
-    if action_type_match and gold_type == "crop_image":
+    if action_type_match and gold_type in {"crop_image", "crop_target"}:
         bbox_iou = iou(gold.get("bbox"), pred.get("bbox"))
     result = {
         "valid_json": bool(valid_json),
@@ -318,6 +361,9 @@ def score_prediction(gold: dict[str, Any], pred: dict[str, Any] | None) -> dict[
         "exact_match": bool(exact_match),
         "field_match": bool(field_match),
         "evidence_overlap": bool(evidence_overlap),
+        "value_equiv": bool(value_equiv),
+        "write_field_value_semantic": bool(write_field_value_semantic),
+        "semantic_action_match": bool(semantic_action_match),
         "scope_match": bool(scope_match),
         "bbox_iou": bbox_iou,
     }
@@ -360,7 +406,7 @@ def compare_field(gold: dict[str, Any], pred: dict[str, Any] | None) -> bool:
     if not isinstance(pred, dict):
         return False
     action = gold.get("action")
-    if action in {"write_claim", "abstain_claim"}:
+    if action in {"write_claim", "abstain_claim", "write_field_value", "abstain_field"}:
         return str(gold.get("field", "")) == str(pred.get("field", ""))
     if action in {"write_claims_batch", "write_claims_chunk"}:
         gold_fields = batch_fields(gold)
@@ -374,6 +420,14 @@ def compare_field(gold: dict[str, Any], pred: dict[str, Any] | None) -> bool:
         return bool(gold_ids) and gold_ids == pred_ids
     if action == "retrieve_evidence":
         return bool(str(pred.get("query", "")).strip()) and str(gold.get("scope", "")) == str(pred.get("scope", ""))
+    if action == "retrieve_fragments":
+        return bool(str(pred.get("query", "")).strip())
+    if action == "open_fragment":
+        return str(gold.get("fragment_id", "")) == str(pred.get("fragment_id", ""))
+    if action == "localize_target":
+        if str(gold.get("target_id", "")) and str(gold.get("target_id", "")) != str(pred.get("target_id", "")):
+            return False
+        return iou(gold.get("target_bbox_norm1000"), pred.get("target_bbox_norm1000")) >= 0.5
     if action == "finish":
         return True
     if action == "inspect_page":
@@ -390,14 +444,68 @@ def compare_field(gold: dict[str, Any], pred: dict[str, Any] | None) -> bool:
 def compare_evidence_ids(gold: dict[str, Any], pred: dict[str, Any] | None) -> bool:
     if not isinstance(pred, dict):
         return False
-    gold_ids = set(map(str, gold.get("evidence_ids") or []))
-    pred_ids = set(map(str, pred.get("evidence_ids") or []))
+    gold_ids = set(map(str, gold.get("evidence_ids") or gold.get("evidence_fragment_ids") or []))
+    pred_ids = set(map(str, pred.get("evidence_ids") or pred.get("evidence_fragment_ids") or []))
     if gold.get("action") in {"write_claims_batch", "write_claims_chunk"}:
         gold_ids = batch_evidence_ids(gold)
         pred_ids = batch_evidence_ids(pred)
     if not gold_ids and not pred_ids:
         return True
     return bool(gold_ids & pred_ids)
+
+
+def compare_value(gold: dict[str, Any], pred: dict[str, Any] | None) -> bool:
+    if not isinstance(pred, dict):
+        return False
+    action = gold.get("action")
+    if action in {"write_claim", "write_field_value"}:
+        return normalized_text_value(gold.get("value")) == normalized_text_value(pred.get("value"))
+    if action in {"write_claims_batch", "write_claims_chunk"}:
+        gold_values = {
+            str(item.get("field")): normalized_text_value(item.get("value"))
+            for item in gold.get("claims") or []
+            if isinstance(item, dict) and item.get("field")
+        }
+        pred_values = {
+            str(item.get("field")): normalized_text_value(item.get("value"))
+            for item in pred.get("claims") or []
+            if isinstance(item, dict) and item.get("field")
+        }
+        return bool(gold_values) and gold_values == pred_values
+    return True
+
+
+def semantic_action_correct(
+    *,
+    gold: dict[str, Any],
+    pred: dict[str, Any] | None,
+    action_type_match: bool,
+    field_match: bool,
+    evidence_overlap: bool,
+    value_equiv: bool,
+) -> bool:
+    if not action_type_match or not isinstance(pred, dict):
+        return False
+    action = gold.get("action")
+    if action == "write_field_value":
+        return field_match and value_equiv and evidence_overlap
+    if action == "write_claim":
+        return field_match and value_equiv and evidence_overlap
+    if action in {"abstain_field", "abstain_claim", "open_fragment", "open_evidence", "select_evidence"}:
+        return field_match
+    if action in {"inspect_page", "finish", "retrieve_fragments", "retrieve_evidence"}:
+        return field_match
+    if action in {"localize_target", "crop_target", "crop_image", "crop_region", "propose_regions"}:
+        return field_match
+    if action in {"write_claims_batch", "write_claims_chunk"}:
+        return field_match and value_equiv and evidence_overlap
+    return field_match
+
+
+def normalized_text_value(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).lower()
+    drop_chars = set(" \t\r\n\u3000\"'“”‘’《》〈〉「」『』（）()【】[]{}·,，.。:：;；/／\\、-—_")
+    return "".join(ch for ch in text if ch not in drop_chars)
 
 
 def batch_fields(action: dict[str, Any] | None) -> set[str]:

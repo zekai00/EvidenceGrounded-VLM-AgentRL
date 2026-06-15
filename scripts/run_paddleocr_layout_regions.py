@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine", choices=["layout", "paddleocr_vl"], default="layout")
     parser.add_argument("--vl-rec-model-dir", default="/root/models/PaddleOCR-VL-1.6")
     parser.add_argument("--layout-model-dir", default="")
+    parser.add_argument("--pipeline-version", default="v1.6")
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--threshold", type=float, default=0.2)
     parser.add_argument("--device", default="")
@@ -82,7 +83,7 @@ def run_engine(args: argparse.Namespace) -> list[Any]:
     from paddleocr import PaddleOCRVL
 
     kwargs = {
-        "pipeline_version": "v1.5",
+        "pipeline_version": args.pipeline_version,
         "vl_rec_model_dir": args.vl_rec_model_dir,
         "use_layout_detection": True,
         "layout_threshold": args.threshold,

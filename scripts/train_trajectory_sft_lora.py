@@ -44,6 +44,11 @@ ALLOWED_ACTIONS = {
     "write_claims_chunk",
     "write_claims_batch",
     "finish",
+    "localize_target",
+    "open_fragment",
+    "retrieve_fragments",
+    "write_field_value",
+    "abstain_field",
 }
 CLAIM_FIELD_SPEC = (
     "caption_text|image_scope|depicted_work_title|displayed_region|object_type|artist|dynasty|"
@@ -255,6 +260,7 @@ def main() -> int:
                 global_step += 1
 
                 if global_step % max(1, args.log_every) == 0 or global_step == 1:
+                    torch_memory = query_torch_cuda_memory()
                     record = {
                         "time": now(),
                         "global_step": global_step,
@@ -262,8 +268,10 @@ def main() -> int:
                         "loss": running_loss / max(1, args.log_every),
                         "lr": scheduler.get_last_lr()[0],
                         "skipped_batches": skipped_batches,
+                        "torch_cuda_memory": torch_memory,
                     }
                     append_jsonl(logs_path, record)
+                    append_torch_cuda_memory(gpu_monitor_path, "train_log", global_step, torch_memory)
                     print(json.dumps(record, ensure_ascii=False), flush=True)
                     running_loss = 0.0
 
@@ -278,6 +286,7 @@ def main() -> int:
                     save_adapter(model, processor, output_dir / f"checkpoint-{global_step}")
 
     final_val_loss = evaluate_loss(model, val_loader, args) if val_loader is not None else None
+    append_torch_cuda_memory(gpu_monitor_path, "final_eval", global_step, query_torch_cuda_memory())
     adapter_dir = output_dir / "adapter"
     save_adapter(model, processor, adapter_dir)
     trainable, total = parameter_counts(model)
@@ -387,6 +396,50 @@ def query_nvidia_smi(gpu_indices: str = "") -> list[dict[str, Any]]:
         except ValueError:
             continue
     return gpus
+
+
+def query_torch_cuda_memory() -> list[dict[str, Any]]:
+    if not torch.cuda.is_available():
+        return []
+    records: list[dict[str, Any]] = []
+    for index in range(torch.cuda.device_count()):
+        try:
+            props = torch.cuda.get_device_properties(index)
+            records.append(
+                {
+                    "gpu_index": index,
+                    "name": props.name,
+                    "memory_allocated_mib": round(torch.cuda.memory_allocated(index) / 1024**2, 2),
+                    "memory_reserved_mib": round(torch.cuda.memory_reserved(index) / 1024**2, 2),
+                    "max_memory_allocated_mib": round(torch.cuda.max_memory_allocated(index) / 1024**2, 2),
+                    "max_memory_reserved_mib": round(torch.cuda.max_memory_reserved(index) / 1024**2, 2),
+                    "source": "torch.cuda",
+                }
+            )
+        except Exception:
+            continue
+    return records
+
+
+def append_torch_cuda_memory(output_path: Path, phase: str, global_step: int, memory: list[dict[str, Any]]) -> None:
+    if not memory:
+        return
+    record = {
+        "time": now(),
+        "timestamp": time.time(),
+        "pid_alive": True,
+        "phase": phase,
+        "global_step": global_step,
+        "gpus": [
+            {
+                **item,
+                "memory_used_mib": int(round(float(item.get("memory_allocated_mib") or 0.0))),
+                "utilization_gpu_pct": 0,
+            }
+            for item in memory
+        ],
+    }
+    append_jsonl(output_path, record)
 
 
 def generate_training_record(output_dir: Path, args: argparse.Namespace) -> None:

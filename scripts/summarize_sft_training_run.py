@@ -113,20 +113,30 @@ def plot_gpu(gpu_log: list[dict[str, Any]], output: Path) -> dict[str, Any]:
     import matplotlib.pyplot as plt
 
     series: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
+    stats: dict[str, Any] = {}
     sample_idx = 0
     for record in gpu_log:
         if not record.get("pid_alive"):
             continue
         for gpu in record.get("gpus") or []:
             try:
-                series[int(gpu["gpu_index"])].append(
-                    (sample_idx, int(gpu["memory_used_mib"]), int(gpu.get("utilization_gpu_pct") or 0))
-                )
+                gpu_index = int(gpu["gpu_index"])
+                series[gpu_index].append((sample_idx, int(gpu["memory_used_mib"]), int(gpu.get("utilization_gpu_pct") or 0)))
+                stat = stats.setdefault(f"gpu{gpu_index}", {})
+                if "max_memory_allocated_mib" in gpu:
+                    stat["max_torch_allocated_mib"] = max(
+                        float(stat.get("max_torch_allocated_mib") or 0.0),
+                        float(gpu.get("max_memory_allocated_mib") or 0.0),
+                    )
+                if "max_memory_reserved_mib" in gpu:
+                    stat["max_torch_reserved_mib"] = max(
+                        float(stat.get("max_torch_reserved_mib") or 0.0),
+                        float(gpu.get("max_memory_reserved_mib") or 0.0),
+                    )
             except Exception:
                 continue
         sample_idx += 1
 
-    stats: dict[str, Any] = {}
     fig, ax1 = plt.subplots(figsize=(9, 4.8), dpi=150)
     for gpu_index, values in sorted(series.items()):
         if not values:
@@ -135,13 +145,16 @@ def plot_gpu(gpu_log: list[dict[str, Any]], output: Path) -> dict[str, Any]:
         mem = [item[1] for item in values]
         util = [item[2] for item in values]
         ax1.plot(xs, mem, linewidth=1.8, label=f"GPU{gpu_index} memory MiB")
-        stats[f"gpu{gpu_index}"] = {
-            "max_memory_mib": max(mem),
-            "mean_memory_mib": round(mean(mem), 2),
-            "max_utilization_pct": max(util),
-            "mean_utilization_pct": round(mean(util), 2),
-            "samples": len(mem),
-        }
+        stat = stats.setdefault(f"gpu{gpu_index}", {})
+        stat.update(
+            {
+                "max_memory_mib": max(mem),
+                "mean_memory_mib": round(mean(mem), 2),
+                "max_utilization_pct": max(util),
+                "mean_utilization_pct": round(mean(util), 2),
+                "samples": len(mem),
+            }
+        )
     ax1.set_xlabel("sample index")
     ax1.set_ylabel("memory used MiB")
     ax1.grid(True, alpha=0.25)
@@ -199,11 +212,17 @@ def write_markdown(
         lines.append(f"![gpu memory]({rel_gpu})")
         lines.append("")
     if gpu_stats:
-        lines.extend(["| GPU | max memory MiB | mean memory MiB | max util % | mean util % | samples |", "|---|---:|---:|---:|---:|---:|"])
+        lines.extend(
+            [
+                "| GPU | max sampled memory MiB | mean sampled memory MiB | max torch allocated MiB | max torch reserved MiB | max util % | mean util % | samples |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
         for gpu, stat in sorted(gpu_stats.items()):
             lines.append(
-                f"| {gpu} | {stat['max_memory_mib']} | {stat['mean_memory_mib']} | "
-                f"{stat['max_utilization_pct']} | {stat['mean_utilization_pct']} | {stat['samples']} |"
+                f"| {gpu} | {stat.get('max_memory_mib')} | {stat.get('mean_memory_mib')} | "
+                f"{stat.get('max_torch_allocated_mib', '')} | {stat.get('max_torch_reserved_mib', '')} | "
+                f"{stat.get('max_utilization_pct')} | {stat.get('mean_utilization_pct')} | {stat.get('samples')} |"
             )
     else:
         lines.append("- 未发现 `gpu_memory_monitor.jsonl`，本次没有可用显存时间序列。")
