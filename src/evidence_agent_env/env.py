@@ -15,11 +15,12 @@ from .tools.claim_tools import (
     apply_claim_write,
     claim_state,
     claim_write_result,
+    is_placeholder_claim_value,
     normalize_abstain,
     normalize_claim,
 )
 from .tools.region_proposal import propose_regions
-from .tool_mask import action_allowed, phase_aware_tool_mask, schema_actions
+from .tool_mask import action_allowed, normalize_claim_field, phase_aware_tool_mask, schema_actions
 from .verifier import EvidenceVerifier, evidence_policy_block_reason, gold_evidence_ids
 
 
@@ -149,6 +150,7 @@ class EvidenceAgentEnv:
             "available_region_ids": sorted(self.regions),
             "selected_evidence_ids": self.selected_evidence_ids,
             "visible_evidence_ids": sorted(self._visible_evidence_items()),
+            "visible_evidence": list(self._visible_evidence_items().values()),
             "target_evidence_hints": self._target_evidence_hints(),
             "valid_crop_count": self.valid_crop_count,
             "last_crop_path": self.last_crop,
@@ -269,6 +271,13 @@ class EvidenceAgentEnv:
                 "display_snippet": item.get("display_snippet") or item.get("evidence_summary") or item.get("text", "")[:600],
             }
         if name == "write_claim":
+            action = self._canonicalize_claim_action(action)
+            field_error = self._claim_field_completion_error([action])
+            if field_error:
+                return {"tool": name, "error": field_error, "claim_state": self._claim_state()}
+            placeholder_error = self._placeholder_claim_error([action])
+            if placeholder_error:
+                return {"tool": name, "error": placeholder_error}
             evidence_error = self._claim_evidence_error([action])
             if evidence_error:
                 return {"tool": name, "error": evidence_error}
@@ -276,23 +285,37 @@ class EvidenceAgentEnv:
             self._upsert_claim(claim)
             return {"tool": name, "claim": claim, "claim_state": self._claim_state()}
         if name == "abstain_claim":
+            action = self._canonicalize_claim_action(action)
+            field_error = self._claim_field_completion_error([action])
+            if field_error:
+                return {"tool": name, "error": field_error, "claim_state": self._claim_state()}
             claim = normalize_abstain(action)
             self._upsert_claim(claim)
             return {"tool": name, "claim": claim, "claim_state": self._claim_state()}
         if name in {"write_claims_chunk", "write_claims_batch"}:
-            evidence_error = self._claim_evidence_error(action.get("claims") or [])
+            claims = [self._canonicalize_claim_action(item) for item in (action.get("claims") or []) if isinstance(item, dict)]
+            abstains = [
+                self._canonicalize_claim_action(item) for item in (action.get("abstains") or []) if isinstance(item, dict)
+            ]
+            field_error = self._claim_field_completion_error([*claims, *abstains])
+            if field_error:
+                return {"tool": name, "error": field_error, "claim_state": self._claim_state()}
+            placeholder_error = self._placeholder_claim_error(claims)
+            if placeholder_error:
+                return {"tool": name, "error": placeholder_error}
+            evidence_error = self._claim_evidence_error(claims)
             if evidence_error:
                 return {"tool": name, "error": evidence_error}
             self.draft_claims = apply_claim_write(
                 self.draft_claims,
-                claims=action.get("claims") or [],
-                abstains=action.get("abstains") or [],
+                claims=claims,
+                abstains=abstains,
             )
             return claim_write_result(
                 name,
                 self.draft_claims,
-                claims=action.get("claims") or [],
-                abstains=action.get("abstains") or [],
+                claims=claims,
+                abstains=abstains,
                 target_fields=self.target_claim_fields,
             )
         if name == "finish":
@@ -312,6 +335,12 @@ class EvidenceAgentEnv:
                 "page_end": item.get("page_end"),
                 "authority_level": item.get("authority_level"),
                 "citation_level": item.get("citation_level"),
+                "adjudicated_evidence_role": item.get("adjudicated_evidence_role"),
+                "adjudication_status": item.get("adjudication_status"),
+                "claim_allowed_fields": item.get("claim_allowed_fields"),
+                "adjudicated_claim_allowed_fields": item.get("adjudicated_claim_allowed_fields")
+                or item.get("claim_allowed_fields"),
+                "usable_for_claim_by_adjudication": item.get("usable_for_claim_by_adjudication"),
                 "claim_use_hint": self._claim_use_hint(item),
                 "display_snippet": item.get("display_snippet") or item.get("text", ""),
             }
@@ -390,6 +419,7 @@ class EvidenceAgentEnv:
             "source_quality": item.get("source_quality"),
             "adjudicated_evidence_role": item.get("adjudicated_evidence_role"),
             "adjudication_status": item.get("adjudication_status"),
+            "claim_allowed_fields": item.get("claim_allowed_fields"),
             "adjudicated_claim_allowed_fields": item.get("adjudicated_claim_allowed_fields"),
             "usable_for_claim_by_adjudication": item.get("usable_for_claim_by_adjudication"),
             "claim_use_hint": self._claim_use_hint(item),
@@ -644,6 +674,45 @@ class EvidenceAgentEnv:
             return f"claim evidence_ids must be non-empty for fields: {empty_fields}"
         if unknown:
             return f"unknown evidence_ids in claim: {sorted(set(unknown))}"
+        return None
+
+    @staticmethod
+    def _canonicalize_claim_action(action: dict[str, Any]) -> dict[str, Any]:
+        field = normalize_claim_field(action.get("field"))
+        if not field or field == action.get("field"):
+            return action
+        return {**action, "field": field}
+
+    def _claim_field_completion_error(self, claims: list[Any]) -> str | None:
+        state = self._claim_state()
+        remaining = {normalize_claim_field(field) for field in (state.get("remaining_fields") or [])}
+        completed = {
+            normalize_claim_field(field)
+            for field in [*(state.get("written_fields") or []), *(state.get("abstained_fields") or [])]
+        }
+        target = {normalize_claim_field(field) for field in self.target_claim_fields}
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            field = normalize_claim_field(claim.get("field"))
+            if not field:
+                return "claim field is required"
+            if field not in target:
+                return f"claim field={field} is not in target fields"
+            if field in completed or field not in remaining:
+                return (
+                    f"claim field={field} is already completed; "
+                    f"remaining_fields={sorted(remaining)}"
+                )
+        return None
+
+    def _placeholder_claim_error(self, claims: list[Any]) -> str | None:
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            if is_placeholder_claim_value(claim.get("value")):
+                field = str(claim.get("field") or "")
+                return f"placeholder value for field={field} should use abstain_claim, not write_claim"
         return None
 
     def _crop(self, bbox: Any, tool: str, extra: dict[str, Any]) -> dict[str, Any]:

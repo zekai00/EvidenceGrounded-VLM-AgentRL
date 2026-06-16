@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -33,6 +34,43 @@ LEGACY_CLAIM_FIELDS = [
 ]
 
 DEFAULT_CLAIM_FIELDS = V1_3_1_CLAIM_FIELDS
+
+PLACEHOLDER_CLAIM_VALUES = {
+    "",
+    "na",
+    "n/a",
+    "none",
+    "null",
+    "unknown",
+    "unspecified",
+    "not specified",
+    "not mentioned",
+    "not shown",
+    "missing",
+    "\u65e0",
+    "\u65e0\u6cd5\u5224\u65ad",
+    "\u6ca1\u6709",
+    "\u4e0d\u8be6",
+    "\u4e0d\u660e",
+    "\u672a\u8be6",
+    "\u672a\u77e5",
+    "\u672a\u6ce8\u660e",
+    "\u672a\u63d0\u53ca",
+    "\u672a\u8bf4\u660e",
+}
+
+
+def normalize_placeholder_value(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[\s\u3000]+", " ", text)
+    return text.strip(" \t\r\n.,;:!?()[]{}<>\"'\u3002\uff0c\uff1b\uff1a\uff01\uff1f\uff08\uff09\u3010\u3011")
+
+
+def is_placeholder_claim_value(value: Any) -> bool:
+    if value is None:
+        return True
+    text = normalize_placeholder_value(value)
+    return text in PLACEHOLDER_CLAIM_VALUES
 
 
 def normalize_confidence(value: Any) -> float:
