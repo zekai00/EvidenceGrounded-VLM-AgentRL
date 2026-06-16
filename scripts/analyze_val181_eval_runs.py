@@ -319,13 +319,21 @@ def copy_sample_images(task_id: str, task: dict[str, Any], assets_dir: Path) -> 
     return copied
 
 
+def compact_action_text(text: Any, max_chars: int = 900) -> str:
+    cleaned = " ".join(str(text).splitlines())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > max_chars:
+        return cleaned[: max_chars - 18].rstrip() + " ...[已截断]"
+    return cleaned
+
+
 def action_lines(task: dict[str, Any], limit: int | None = None) -> list[str]:
     debug = task.get("debug") or {}
     raw = list(debug.get("raw_actions") or [])
     out = []
     total = len(raw)
     for idx, text in enumerate(raw[: limit or total], start=1):
-        out.append(f"{idx:02d}. {text}")
+        out.append(f"{idx:02d}. {compact_action_text(text)}")
     if limit and total > limit:
         out.append(f"... ({total - limit} more actions)")
     return out
@@ -334,8 +342,8 @@ def action_lines(task: dict[str, Any], limit: int | None = None) -> list[str]:
 def invalid_reason_lines(task: dict[str, Any]) -> str:
     reasons = list((task.get("debug") or {}).get("invalid_reasons") or [])
     if not reasons:
-        return "Invalid reasons: none"
-    lines = ["Invalid reasons:"]
+        return "非法/修复原因：无"
+    lines = ["非法/修复原因："]
     for reason in reasons:
         lines.append(f"- {reason}")
     return "\n".join(lines)
@@ -425,7 +433,7 @@ def build_report(results: dict[str, dict[str, Any]], report_dir: Path, assets_di
             fmt(summary.get("duration_minutes"), 2),
         ])
     summary_table = md_table(
-        ["Run", "Reward mean", "Min", "Max", "Finish", "Traj success", "Claim F1", "Abstain F1", "Unsupported", "Invalid steps", "Turns mean", "Minutes"],
+        ["方案", "奖励均值", "最低分", "最高分", "Finish率", "轨迹成功率", "Claim F1", "Abstain F1", "Unsupported均值", "非法步数", "平均轮数", "耗时(分钟)"],
         rows,
     )
 
@@ -443,7 +451,7 @@ def build_report(results: dict[str, dict[str, Any]], report_dir: Path, assets_di
             fmt(sa.get("unsupported_claim_count_mean", 0) - sb.get("unsupported_claim_count_mean", 0)),
         ])
     delta_table = md_table(
-        ["Delta", "Reward", "Finish", "Traj success", "Claim F1", "Abstain F1", "Unsupported"],
+        ["对比", "奖励变化", "Finish变化", "轨迹成功变化", "Claim F1变化", "Abstain F1变化", "Unsupported变化"],
         delta_rows,
     )
 
@@ -461,7 +469,7 @@ def build_report(results: dict[str, dict[str, Any]], report_dir: Path, assets_di
             fmt(action_avg.get("finish", 0), 2),
         ])
     action_table = md_table(
-        ["Run", "inspect", "crop", "open", "retrieve", "write", "abstain", "finish"],
+        ["方案", "inspect", "crop", "open", "retrieve", "write", "abstain", "finish"],
         action_rows,
     )
 
@@ -483,12 +491,12 @@ def build_report(results: dict[str, dict[str, Any]], report_dir: Path, assets_di
             task = results[run_key]["tasks"][task_id]
             metrics = task["metrics"]
             score_bits.append(
-                f"{summaries[run_key]['short']}: score={fmt(metrics.get('score'))}, finish={fmt(metrics.get('finish'))}, "
-                f"claim_f1={fmt(metrics.get('claim_support_f1'))}, abstain_f1={fmt(metrics.get('abstain_f1'))}, "
+                f"{summaries[run_key]['short']}：得分={fmt(metrics.get('score'))}，finish={fmt(metrics.get('finish'))}，"
+                f"claim_f1={fmt(metrics.get('claim_support_f1'))}，abstain_f1={fmt(metrics.get('abstain_f1'))}，"
                 f"unsupported={fmt(metrics.get('unsupported_claim_count'))}"
             )
         image_md = []
-        for key, label in [("overlay_image", "Overlay"), ("artwork_image", "Target crop"), ("caption_image", "Caption crop")]:
+        for key, label in [("overlay_image", "页面标注图"), ("artwork_image", "目标裁剪图"), ("caption_image", "Caption 裁剪图")]:
             path = image_paths.get(key)
             if path:
                 rel = Path(path).relative_to(report_dir)
@@ -500,7 +508,7 @@ def build_report(results: dict[str, dict[str, Any]], report_dir: Path, assets_di
             actions = "\n".join(action_lines(task))
             invalids = invalid_reason_lines(task)
             actions_blocks.append(
-                f"<details><summary>{summaries[run_key]['short']} full actions</summary>\n\n"
+                f"<details><summary>{summaries[run_key]['short']} 完整动作序列</summary>\n\n"
                 f"{invalids}\n\n"
                 f"```text\n{actions}\n```\n\n</details>"
             )
@@ -519,44 +527,44 @@ def build_report(results: dict[str, dict[str, Any]], report_dir: Path, assets_di
         )
 
     paths_table = md_table(
-        ["Run", "Model/checkpoint", "Validation JSONL", "Log"],
+        ["方案", "模型/Checkpoint", "Validation JSONL", "日志"],
         [
             [summaries[k]["short"], summaries[k]["model_path"], summaries[k]["jsonl"], summaries[k]["log"]]
             for k in ["base", "sft", "rl"]
         ],
     )
 
-    report = f"""# val181 Base / SFT / RL 对照评测报告
+    report = f"""# val181 三组模型对照评测报告（Base / SFT / RL）
 
 生成时间：{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 ## 结论摘要
 
-- 这次完整评测覆盖 `181` 个 trajectory-level validation tasks，三组使用同一套 agent loop、reward、deterministic validation 设置。
-- Base reward mean = `{fmt(summaries['base'].get('score_mean'))}`；SFT reward mean = `{fmt(summaries['sft'].get('score_mean'))}`；RL reward mean = `{fmt(summaries['rl'].get('score_mean'))}`。
+- 这次完整评测覆盖 `181` 个 trajectory-level validation tasks，三组使用同一套 agent loop、reward 和确定性 validation 设置。
+- Base 奖励均值 = `{fmt(summaries['base'].get('score_mean'))}`；SFT 奖励均值 = `{fmt(summaries['sft'].get('score_mean'))}`；RL 奖励均值 = `{fmt(summaries['rl'].get('score_mean'))}`。
 - SFT 在完整 val181 上低于 base，主要说明 continued-B SFT adapter 会模仿轨迹格式，但泛化到全量 validation 时有更多错误 claim / abstain 策略偏差。
 - Stage A5.3 GRPO 160-step 在 val181 上相对 SFT 提升 `{fmt(summaries['rl'].get('score_mean', 0) - summaries['sft'].get('score_mean', 0))}`，相对 base 提升 `{fmt(summaries['rl'].get('score_mean', 0) - summaries['base'].get('score_mean', 0))}`。
 - RL 的主要收益来自 `finish_rate`、`trajectory_success`、`claim_support_f1` 和 `invalid_steps`；`unsupported_claim_count` 仍是残余问题，RL 均值 `{fmt(summaries['rl'].get('unsupported_claim_count_mean'))}` 略高于 SFT `{fmt(summaries['sft'].get('unsupported_claim_count_mean'))}` 和 base `{fmt(summaries['base'].get('unsupported_claim_count_mean'))}`。
 - 用户给出的 `...20260616_0410` RL 目录为空；本次使用实际完整 checkpoint：`{summaries['rl']['model_path']}`。
 
-## Evaluation Setup
+## 评测设置
 
-- Split: `/root/datasets/evidence_grounded_vlm_agentrl/rlvr_v1_3_1_trajectory_level_latest/verl/val.parquet`
-- Size: `181` rows, `181` unique task IDs.
-- Runtime: `trainer.val_only=true`, no optimizer update, no checkpoint save.
-- Generation: `MAX_RESPONSE_LENGTH=6144`, `max_model_len=16384`, `temperature=0`, `do_sample=false`, `n=1`.
-- Parallelism: `N_GPUS_PER_NODE=4`, `AGENT_NUM_WORKERS=4`; debug traces are padded to `184` files, but metrics below are deduplicated to the 181 validation task IDs.
-- Script: `scripts/run_verl_v1_3_1_trajectory_val_eval.sh`.
+- 数据切分：`/root/datasets/evidence_grounded_vlm_agentrl/rlvr_v1_3_1_trajectory_level_latest/verl/val.parquet`
+- 样本规模：`181` 行，`181` 个唯一 task ID。
+- 运行模式：`trainer.val_only=true`，只做 validation，不更新 optimizer，不保存新 checkpoint。
+- 生成设置：`MAX_RESPONSE_LENGTH=6144`，`max_model_len=16384`，`temperature=0`，`do_sample=false`，`n=1`。
+- 并行设置：`N_GPUS_PER_NODE=4`，`AGENT_NUM_WORKERS=4`；debug trace 会 pad 到 `184` 个文件，下方指标已按 181 个唯一 validation task 去重。
+- 启动脚本：`scripts/run_verl_v1_3_1_trajectory_val_eval.sh`。
 
 ## 主指标
 
 {summary_table}
 
-![Reward mean]({plot_reward.relative_to(report_dir).as_posix()})
+![奖励均值]({plot_reward.relative_to(report_dir).as_posix()})
 
-![Core success]({plot_core.relative_to(report_dir).as_posix()})
+![轨迹成功率]({plot_core.relative_to(report_dir).as_posix()})
 
-![Unsupported claims]({plot_errors.relative_to(report_dir).as_posix()})
+![Unsupported claim 均值]({plot_errors.relative_to(report_dir).as_posix()})
 
 ## 增量对比
 
@@ -570,20 +578,20 @@ def build_report(results: dict[str, dict[str, Any]], report_dir: Path, assets_di
 
 ## 指标解释
 
-- `Reward mean`: verl validation JSONL 中的 `score` 均值，是本次主对比指标。
-- `Finish`: trajectory 最终是否合法调用 `finish`。
-- `Trajectory success`: reward 侧综合成功标记，通常要求定位、证据、claim/abstain 和 finish 都基本满足。
-- `Claim F1`: 支持性 claim 的 field/evidence 支持匹配 F1，越高说明写出的 claim 更能被证据支撑。
-- `Abstain F1`: 对无证据字段是否正确显式 abstain 的 F1。
-- `Unsupported`: 平均每条轨迹中 unsupported claim 数，越低越好。
-- `Invalid steps`: 平均每条轨迹非法 action/解析失败步数，越低越好。
-- `Turns mean`: verl 日志里的响应轮数统计；它和 `steps` 不完全等价，会包含 agent loop 的 tool/assistant 交互轮。
+- 奖励均值：verl validation JSONL 中的 `score` 均值，是本次主对比指标。
+- Finish率：trajectory 最终是否合法调用 `finish`。
+- 轨迹成功率：reward 侧综合成功标记，通常要求定位、证据、claim/abstain 和 finish 都基本满足。
+- Claim F1：支持性 claim 的 field/evidence 支持匹配 F1，越高说明写出的 claim 更能被证据支撑。
+- Abstain F1：对无证据字段是否正确显式 abstain 的 F1。
+- Unsupported均值：平均每条轨迹中 unsupported claim 数，越低越好。
+- 非法步数：平均每条轨迹非法 action/解析失败步数，越低越好。
+- 平均轮数：verl 日志里的响应轮数统计；它和 `steps` 不完全等价，会包含 agent loop 的 tool/assistant 交互轮。
 
 ## 样例轨迹
 
-下面样例包含图像、三组得分和完整 action 序列。图像中的 `Overlay` 是页面标注图，`Target crop` 是目标图，`Caption crop` 是 caption 区域。
+下面样例包含图像、三组得分和动作序列。为保证 Markdown 可读性，单步原始输出会被规范成单行展示；极长的异常输出会标记为 `...[已截断]`。完整原始输出仍可从后面的 JSONL 和 debug trace 路径追溯。
 
-{chr(10).join(sample_sections)}
+{(chr(10) * 2).join(sample_sections)}
 
 ## 运行路径
 
@@ -595,9 +603,9 @@ def build_report(results: dict[str, dict[str, Any]], report_dir: Path, assets_di
 - 聚合 JSON: `val181_metrics_summary.json`
 - 图片资产目录: `assets/`
 
-## English Brief
+## 中文总结
 
-This report compares the base Qwen2.5-VL-3B-Instruct model, the continued-B SFT LoRA, and the Stage A5.3 GRPO 160-step checkpoint on the full `val181` trajectory-level validation split. All runs use the same agent loop, reward function, deterministic validation settings, and response/model length limits. The RL checkpoint substantially improves the main reward, finish rate, trajectory success rate, claim support F1, and invalid-step rate. Unsupported claims remain a residual issue: the RL run is slightly worse than SFT/base on the mean unsupported-claim count. The SFT-only adapter is worse than the base model on the full validation split, which indicates that imitation alone learned the trajectory format but did not robustly learn when to abstain or how to avoid unsupported claims.
+本报告比较了 base Qwen2.5-VL-3B-Instruct、continued-B SFT LoRA 和 Stage A5.3 GRPO 160-step checkpoint 在完整 `val181` trajectory-level validation split 上的表现。三组使用相同 agent loop、reward、确定性 validation 参数和长度上限。结果显示，RL checkpoint 显著提升主 reward、finish rate、trajectory success、claim support F1，并明显降低 invalid steps。仍需继续优化的是 unsupported claim：RL 的 unsupported claim 均值略高于 SFT/base。SFT-only adapter 在完整 validation 上低于 base，说明单纯模仿能学到动作格式，但还不足以稳定学会证据不足时 abstain、以及避免 unsupported claim。
 """
     return report
 
