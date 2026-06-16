@@ -159,19 +159,20 @@ def build_prompt_text(obs: dict[str, Any], config: PromptConfig) -> str:
                 )
             )
     evidence_id_rule = (
-        "当前可用 evidence_ids（open_evidence/write_claims_chunk/write_claim/write_claims_batch 只能使用这里或工具返回里明确出现过的 id；必须逐字符原样复制完整 id，包括所有下划线；禁止编造 ev_888、ev_xxx 等占位 id）："
+        "当前可用 evidence_ids（open_evidence/write_claim 只能使用这里或工具返回里明确出现过的 id；必须逐字符原样复制完整 id，包括所有下划线；禁止编造 ev_888、ev_xxx 等占位 id）："
         if config.tool_schema == "no_select"
-        else "当前可用 evidence_ids（open_evidence/select_evidence/write_claims_chunk 只能使用这里或工具返回里明确出现过的 id；必须逐字符原样复制完整 id，包括所有下划线；禁止编造 ev_888、ev_xxx 等占位 id）："
+        else "当前可用 evidence_ids（open_evidence/select_evidence/write_claim 只能使用这里或工具返回里明确出现过的 id；必须逐字符原样复制完整 id，包括所有下划线；禁止编造 ev_888、ev_xxx 等占位 id）："
     )
     tool_order_rule = (
-        "工具顺序约束：open_evidence 不是搜索工具，只能打开当前可用 evidence_ids 中已经出现的 id；crop 后最多先打开 1 条可见 local evidence，之后应 retrieve_evidence 或 write_claims_chunk，不要反复 open_evidence；本协议禁止 select_evidence。"
+        "工具顺序约束：open_evidence 不是搜索工具，只能打开当前可用 evidence_ids 中已经出现的 id；crop 后最多先打开 1 条可见 local evidence，之后应 retrieve_evidence、write_claim 或 abstain_claim，不要反复 open_evidence；本协议禁止 select_evidence。"
         if config.tool_schema == "no_select"
-        else "工具顺序约束：open_evidence 不是搜索工具，只能打开当前可用 evidence_ids 中已经出现的 id；crop 后最多先打开 1 条可见 local evidence，之后应 retrieve_evidence 或 write_claims_chunk，不要反复 open_evidence。"
+        else "工具顺序约束：open_evidence 不是搜索工具，只能打开当前可用 evidence_ids 中已经出现的 id；crop 后最多先打开 1 条可见 local evidence，之后应 retrieve_evidence、write_claim 或 abstain_claim，不要反复 open_evidence。"
     )
     lines.extend(
         [
             "约束：只输出一个 JSON 对象；不要输出 markdown；不要编造作品名、画家、朝代、技法；证据不足就 abstain；如果给出了当前阶段允许的工具，action 必须在该列表中；done 不是 action 名，完成时只能输出 {\"action\":\"finish\",\"status\":\"done\"}，且只有 finish 出现在允许工具中才可使用。",
             "证据边界约束：如果证据摘要包含 adjudicated_claim_allowed_fields，只能用该 evidence 支持这些字段；如果 usable_for_claim_by_adjudication=false 或 adjudication_status 不是 accepted_auto，应对该字段 abstain 或继续检索。",
+            "占位值约束：write_claim 不允许使用 无、未注明、不详、未知、unknown、not mentioned、N/A 等占位值；遇到这种情况必须调用 abstain_claim。",
             tool_order_rule,
             "历史动作（保留最近若干步）：",
             json.dumps(history, ensure_ascii=False, separators=(",", ":")),
@@ -241,16 +242,17 @@ def final_action_guard(obs: dict[str, Any], config: PromptConfig, current_claim_
         if remaining:
             return (
                 "最终动作约束：当前阶段只允许继续写 claim 或 abstain。"
-                "优先调用 write_claims_chunk，一次只写 1 个 remaining_fields 中的字段；"
-                "也可以用 write_claim 写单个字段。visual_elements、composition 等长字段必须简短，不要输出重复长数组。"
+                "一次只处理 1 个 remaining_fields 中的字段：有明确证据则 write_claim，否则 abstain_claim。"
+                "禁止用 无、未注明、不详、unknown、not mentioned、N/A 等占位值写 claim。"
             )
         return "最终动作约束：当前字段已经完成，本步应输出 {\"action\":\"finish\",\"status\":\"done\"}。"
     if phase in {"local_evidence_opening", "evidence_retrieval_after_open", "evidence_opening"} and "retrieve_evidence" in allowed:
         return (
             "最终动作约束：本步如果调用 retrieve_evidence，query 必须短且可闭合为合法 JSON："
+            "scope 只能是 current_page、nearby_pages、same_document、corpus 之一，默认优先 same_document；"
             "query 长度不超过 80 个汉字/英文词，禁止重复同一个词组或作品名，禁止把整段证据复制进 query；"
             "优先用 source_file 短标题 + 当前图注关键词 + 山水画/桥梁/构图等 1-3 个检索词。"
-            "如果当前阶段还允许 write_claims_chunk 且本地 evidence 已足够，也可以直接写 claim；"
+            "如果当前阶段还允许 write_claim 且本地 evidence 已足够，也可以直接写 claim；证据不足则 abstain_claim。"
             "无论选择哪个 action，都必须输出完整闭合的单个 JSON 对象。"
         )
     if len(allowed) == 1:
@@ -276,10 +278,9 @@ def claim_phase_hint(obs: dict[str, Any], config: PromptConfig, current_claim_st
                 )
             return (
                 f"阶段提示：当前已经进入 claim 写入阶段，当前阶段禁止继续 {blocked_tools}。"
-                "如果 current_claim_state.remaining_fields 仍有字段，下一步必须优先调用 write_claims_chunk，"
-                "一次只写 1 个尚未写过的字段；也可以用 write_claim 写单个字段。"
-                "证据不足的字段用 abstain_claim 或 write_claims_chunk.abstains。"
-                "不要重复已经在 written_fields 或 abstained_fields 中出现的字段；复杂字段必须简短，避免超长 JSON。"
+                "如果 current_claim_state.remaining_fields 仍有字段，下一步一次只处理 1 个尚未写过的字段。"
+                "证据明确支持该字段才用 write_claim；证据不足、未注明、不详、unknown、not mentioned、N/A 都必须用 abstain_claim。"
+                "不要重复已经在 written_fields 或 abstained_fields 中出现的字段。"
                 + extra
             )
         return "阶段提示：当前 claim 字段已经写完或 abstain 完成，下一步必须调用 finish。"
@@ -299,8 +300,8 @@ def claim_phase_hint(obs: dict[str, Any], config: PromptConfig, current_claim_st
         return (
             "阶段提示：当前通常已经完成候选区域选择、裁剪、证据检索和证据打开；"
             f"如果 claim_state 显示仍有待写字段，并且{evidence_phrase}，"
-            "优先调用 write_claims_chunk 写入下一组结构化 claim。"
-            "每次只写 1 个字段，复杂字段必须简短。除非明确缺少必要证据，否则不要继续 open_evidence 或 finish。"
+            "优先用 write_claim 写入下一个有明确证据支持的字段；证据不足则用 abstain_claim。"
+            "每次只处理 1 个字段。除非明确缺少必要证据，否则不要继续 open_evidence 或 finish。"
             + extra
         )
     return ""
@@ -379,9 +380,10 @@ def tool_schema_lines(schema: str, allowed_actions: list[str] | None = None) -> 
         filtered = [text for action, text in rows if keep(action)]
         lines.extend(f"{idx}. {text}" for idx, text in enumerate(filtered, start=1))
         if schema == "no_select":
-            lines.append("工具顺序：inspect_page -> crop_target -> open_evidence(可见 local_caption_id，可选) -> retrieve_evidence -> open_evidence(检索结果，可选) -> write_claims_chunk/write_claim/abstain_claim -> finish；禁止 select_evidence。")
+            lines.append("工具顺序：inspect_page -> crop_target -> open_evidence(可见 local_caption_id，可选) -> retrieve_evidence -> open_evidence(检索结果，可选) -> write_claim/abstain_claim -> finish；禁止 select_evidence。")
         else:
-            lines.append("工具顺序：inspect_page -> crop_target -> retrieve/open/select evidence -> write_claims_chunk/write_claim/abstain_claim -> finish。")
+            lines.append("工具顺序：inspect_page -> crop_target -> retrieve/open/select evidence -> write_claim/abstain_claim -> finish。")
+        lines.append("证据不足、未注明、不详、unknown、not mentioned、N/A 必须用 abstain_claim，不能用 write_claim 写占位值。")
         return lines
     if schema == "chunked_claim":
         return [
@@ -397,7 +399,7 @@ def tool_schema_lines(schema: str, allowed_actions: list[str] | None = None) -> 
             '9. {"action":"abstain_claim","field":"字段名","reason":"证据不足原因"}',
             f'10. {{"action":"write_claims_batch","claims":[{{"field":"{CLAIM_FIELD_SPEC}","value":值,"evidence_ids":["ev_xxx"],"visual_bbox":[x1,y1,x2,y2]或null,"confidence":0到1}}],"abstains":[{{"field":"字段名","reason":"证据不足原因"}}]}}',
             '11. {"action":"finish","status":"done"}',
-            "写 claim 阶段优先使用 write_claims_chunk；每次只写 1 个字段；也可以用 write_claim 写单个字段；不要重复已经在 claim_state.written_fields 或 abstained_fields 中出现的字段。",
+            "写 claim 阶段每次只处理 1 个字段；有明确证据才用 write_claim，证据不足或占位值情况必须用 abstain_claim；不要重复已经在 claim_state.written_fields 或 abstained_fields 中出现的字段。",
         ]
     if schema == "evidence_select":
         return [
@@ -447,7 +449,7 @@ def coordinate_rule(schema: str) -> str:
     if schema == "no_select":
         return (
             "坐标规则：inspect_page 会返回 layout regions；region bbox 和 crop_target 的 bbox 都使用第 1 张 PDF 原始页面图像的像素坐标，原点在左上角，格式为 [x1,y1,x2,y2]；"
-            "当前页面没有红框，先用 inspect_page 检查页面布局，再用 crop_target 裁剪目标图像；证据 id 可直接由 open_evidence/write_claims_chunk 使用，不调用 select_evidence。"
+            "当前页面没有红框，先用 inspect_page 检查页面布局，再用 crop_target 裁剪目标图像；证据 id 可直接由 open_evidence/write_claim 使用，不调用 select_evidence。"
         )
     if schema in {"region", "evidence_select", "chunked_claim"}:
         return (

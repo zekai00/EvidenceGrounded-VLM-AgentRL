@@ -7,6 +7,14 @@ from typing import Any
 from .actions import ALLOWED_ACTIONS
 
 
+FIELD_ALIASES = {
+    "title": "depicted_work_title",
+    "artist": "creator_or_attribution",
+    "dynasty": "creation_period_or_dynasty",
+    "collection": "collection_institution",
+    "medium_dimensions": "dimensions",
+}
+
 ACTION_ORDER = [
     "inspect_page",
     "propose_regions",
@@ -113,11 +121,11 @@ def phase_aware_tool_mask(obs: dict[str, Any]) -> dict[str, Any]:
         )
 
     if has_claims:
-        return decision(
+        return claim_phase_decision(
             "claim_continuation",
-            ["write_claim", "write_claims_chunk", "abstain_claim"],
-            "claims have already started and remaining fields still exist; continue chunk writing or abstain remaining fields before finish.",
+            "claims have already started and remaining fields still exist; write one field at a time or abstain remaining fields before finish.",
             obs,
+            remaining_fields,
         )
 
     if not has_regions:
@@ -145,11 +153,13 @@ def phase_aware_tool_mask(obs: dict[str, Any]) -> dict[str, Any]:
 
     if not has_retrieved:
         if opened_count >= 1:
-            return decision(
+            return claim_phase_decision(
                 "evidence_retrieval_after_open",
-                ["select_evidence", "retrieve_evidence", "write_claim", "write_claims_chunk", "abstain_claim"],
                 "one evidence item has already been opened before retrieval; stop opening repeatedly, then retrieve more evidence or write claims.",
                 obs,
+                remaining_fields,
+                extra_actions=["select_evidence", "retrieve_evidence"],
+                keep_extra_when_unsupported=True,
             )
         return decision(
             "evidence_retrieval",
@@ -159,34 +169,41 @@ def phase_aware_tool_mask(obs: dict[str, Any]) -> dict[str, Any]:
         )
 
     if retrieved_count < 4:
-        return decision(
+        return claim_phase_decision(
             "evidence_opening",
-            ["select_evidence", "open_evidence", "retrieve_evidence", "write_claim", "write_claims_chunk"],
             "retrieval results or visible local evidence are available; open/select evidence, continue bounded retrieval if needed, or write if enough evidence is visible.",
             obs,
+            remaining_fields,
+            extra_actions=["select_evidence", "open_evidence", "retrieve_evidence"],
+            keep_extra_when_unsupported=True,
         )
 
     if opened_count < 8:
-        return decision(
+        return claim_phase_decision(
             "evidence_opening_after_retrieval_cap",
-            ["select_evidence", "open_evidence", "write_claim", "write_claims_chunk", "abstain_claim"],
             "the bounded retrieval budget has been used; open/select visible evidence or write claims instead of retrieving again.",
             obs,
+            remaining_fields,
+            extra_actions=["select_evidence", "open_evidence"],
+            keep_extra_when_unsupported=True,
         )
 
     if has_selected or opened_count >= 8 or retrieved_count >= 4:
-        return decision(
+        return claim_phase_decision(
             "claim_ready",
-            ["select_evidence", "write_claim", "write_claims_chunk", "abstain_claim"],
             "enough evidence has been retrieved/opened; select visible evidence if needed, then write claims instead of repeatedly opening evidence.",
             obs,
+            remaining_fields,
+            extra_actions=["select_evidence"],
         )
 
-    return decision(
+    return claim_phase_decision(
         "evidence_opening",
-        ["select_evidence", "open_evidence", "retrieve_evidence", "write_claim", "write_claims_chunk"],
         "retrieval results are available; open/select evidence, or write if enough evidence is already visible.",
         obs,
+        remaining_fields,
+        extra_actions=["select_evidence", "open_evidence", "retrieve_evidence"],
+        keep_extra_when_unsupported=True,
     )
 
 
@@ -217,11 +234,11 @@ def no_select_phase_mask(
         )
 
     if has_claims:
-        return decision(
+        return claim_phase_decision(
             "claim_continuation",
-            ["write_claim", "write_claims_chunk", "abstain_claim"],
             "claims have already started and remaining fields still exist; continue writing or abstain remaining fields before finish.",
             obs,
+            remaining_fields,
         )
 
     if not has_regions:
@@ -251,26 +268,38 @@ def no_select_phase_mask(
         )
 
     if not has_retrieved:
-        return decision(
+        return claim_phase_decision(
             "evidence_retrieval_after_open",
-            ["retrieve_evidence", "write_claim", "write_claims_chunk", "abstain_claim"],
             "one local evidence item has already been opened; retrieve more evidence or write/abstain if the local evidence is sufficient.",
             obs,
+            remaining_fields,
+            extra_actions=["retrieve_evidence"],
+            keep_extra_when_unsupported=True,
+        )
+
+    if opened_count >= 1:
+        return claim_phase_decision(
+            "claim_ready",
+            "retrieved evidence has been opened; write or abstain missing fields instead of continuing evidence navigation.",
+            obs,
+            remaining_fields,
         )
 
     if retrieved_count < 3 and opened_count < 4:
-        return decision(
+        return claim_phase_decision(
             "evidence_opening",
-            ["open_evidence", "retrieve_evidence", "write_claim", "write_claims_chunk", "abstain_claim"],
             "retrieval results are available; open evidence, optionally retrieve again within budget, or write claims.",
             obs,
+            remaining_fields,
+            extra_actions=["open_evidence", "retrieve_evidence"],
+            keep_extra_when_unsupported=True,
         )
 
-    return decision(
+    return claim_phase_decision(
         "claim_ready",
-        ["open_evidence", "write_claim", "write_claims_chunk", "abstain_claim"],
         "enough evidence has been retrieved/opened; write claims instead of continuing broad retrieval.",
         obs,
+        remaining_fields,
     )
 
 
@@ -314,3 +343,93 @@ def decision(phase: str, allowed: list[str], reason: str, obs: dict[str, Any]) -
         "step": len(obs.get("history") or []),
         "tool_schema": obs.get("tool_schema"),
     }
+
+
+def claim_phase_decision(
+    phase: str,
+    reason: str,
+    obs: dict[str, Any],
+    remaining_fields: list[Any],
+    *,
+    extra_actions: list[str] | None = None,
+    keep_extra_when_unsupported: bool = False,
+) -> dict[str, Any]:
+    next_field = str(remaining_fields[0]) if remaining_fields else ""
+    priority_field = caption_text_priority_field(obs, remaining_fields)
+    field_for_support = priority_field or next_field
+    support = visible_evidence_supports_field(obs, field_for_support) if field_for_support else None
+    extra = list(extra_actions or [])
+    if priority_field:
+        allowed = ["write_claim"]
+        reason = (
+            reason
+            + " caption_text is still missing and supported by current visible/opened evidence; "
+            + "write_claim must complete caption_text before other claim fields."
+        )
+        return decision(phase, allowed, reason, obs)
+    if support is True:
+        allowed = extra + ["write_claim", "abstain_claim"]
+        reason = (
+            reason
+            + f" next_missing={next_field} is supported by current visible/opened evidence; write_claim is allowed, abstain_claim remains available if the sampled field lacks support."
+        )
+    elif support is False:
+        allowed = (extra if keep_extra_when_unsupported else []) + ["abstain_claim"]
+        reason = (
+            reason
+            + f" next_missing={next_field} has no current visible/opened evidence with allowed_fields support; write_claim is blocked."
+        )
+    else:
+        allowed = extra + ["write_claim", "abstain_claim"]
+        reason = (
+            reason
+            + f" next_missing={next_field}; no field-policy metadata is visible, so write_claim or abstain_claim remain available."
+        )
+    return decision(phase, allowed, reason, obs)
+
+
+def caption_text_priority_field(obs: dict[str, Any], remaining_fields: list[Any]) -> str | None:
+    remaining = {normalize_claim_field(field) for field in remaining_fields}
+    if "caption_text" not in remaining:
+        return None
+    if visible_evidence_supports_field(obs, "caption_text") is True:
+        return "caption_text"
+    return None
+
+
+def visible_evidence_supports_field(obs: dict[str, Any], field: str) -> bool | None:
+    normalized = normalize_claim_field(field)
+    if not normalized:
+        return None
+    saw_policy = False
+    for item in visible_evidence_policy_items(obs):
+        allowed = item.get("adjudicated_claim_allowed_fields") or item.get("claim_allowed_fields") or item.get("allowed_fields")
+        if not allowed:
+            continue
+        saw_policy = True
+        allowed_set = {normalize_claim_field(value) for value in allowed}
+        if normalized in allowed_set:
+            return True
+    return False if saw_policy else None
+
+
+def visible_evidence_policy_items(obs: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for item in obs.get("visible_evidence") or []:
+        if isinstance(item, dict):
+            items.append(item)
+    for result in obs.get("tool_results") or []:
+        if not isinstance(result, dict):
+            continue
+        if result.get("tool") == "open_evidence" and result.get("evidence_id") and not result.get("error"):
+            items.append(result)
+        elif result.get("tool") == "select_evidence":
+            for item in result.get("selected_evidence") or []:
+                if isinstance(item, dict):
+                    items.append(item)
+    return items
+
+
+def normalize_claim_field(field: Any) -> str:
+    text = str(field or "")
+    return FIELD_ALIASES.get(text, text)

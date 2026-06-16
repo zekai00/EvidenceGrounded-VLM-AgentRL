@@ -378,6 +378,7 @@ def build_verl_record(
         "tool_schema": args.tool_schema,
         "target_claim_fields": V13_FIELDS,
         "reward_mode": "trajectory_level_v1_3_1",
+        "field_policy_hints": True,
     }
     return {
         "data_source": "evidence_grounded_v1_3_1_trajectory_rlvr",
@@ -416,9 +417,11 @@ def build_initial_prompt(task: dict[str, Any], args: argparse.Namespace) -> str:
             "fields=" + json.dumps(V13_FIELDS, ensure_ascii=False, separators=(",", ":")),
             "Output exactly one JSON object per turn. No markdown, no prose, no list, no code fence.",
             "First action only: {\"action\":\"inspect_page\",\"top_k\":12}",
-            "Later actions: inspect_page,crop_target,open_evidence,retrieve_evidence,write_claim,abstain_claim,finish. No select_evidence.",
-            "Use only evidence ids visible in state/tool results. If support is insufficient, abstain_claim. Do not fill artist/period/collection/dimensions/medium from common knowledge.",
+            "Later actions: inspect_page,crop_target,open_evidence,retrieve_evidence,write_claim,abstain_claim,finish. No select_evidence. write_claims_chunk is disabled in Stage A++ unless it appears in allowed.",
+            "Use only evidence ids visible in state/tool results. r_* ids are region_ids for crop_target only; v13_t_* ids are evidence_ids for open/write. Never put r_* in evidence_ids. If support is insufficient, call abstain_claim. Do not fill artist/period/collection/dimensions/medium from common knowledge.",
+            "Never use write_claim with placeholder values such as 无, 未注明, 不详, unknown, not mentioned, N/A. Those are abstain cases and must use abstain_claim(field,reason).",
             "Schema keys: crop_target(region_id), open_evidence(evidence_id), retrieve_evidence(query,scope,top_k), write_claim(field,value,evidence_ids,confidence), abstain_claim(field,reason), finish(status).",
+            "Never wrap parameters inside result. Never use Chinese JSON keys. Examples: {\"action\":\"crop_target\",\"region_id\":\"r_target_candidate\"}; {\"action\":\"open_evidence\",\"evidence_id\":\"v13_t_xxx_caption\"}.",
             "local_hints_not_answers=" + json.dumps(hints[:2], ensure_ascii=False, separators=(",", ":")),
             "Now output only {\"action\":\"inspect_page\",\"top_k\":12}.",
         ]

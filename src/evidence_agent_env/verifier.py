@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .actions import bbox_iou
+from .tools.claim_tools import is_placeholder_claim_value
 
 
 CLAIM_FIELDS = {
@@ -110,22 +111,26 @@ class EvidenceVerifier:
         if name == "write_claim":
             if int(result.get("valid_crop_count") or 0) <= 0:
                 return -0.05
+            if is_placeholder_claim_value(action.get("value")):
+                return -0.18 if self.reward_mode == "field_policy_probe" else -0.12
             if self.reward_mode == "field_policy_probe":
-                return 0.28 if self._claim_supported(task, action) else -0.12
+                return 0.28 if self._claim_supported(task, action) else -0.14
             return 0.2 if self._claim_supported(task, action) else -0.05
         if name == "abstain_claim":
-            return 0.1 if self._gold_abstains(task, str(action.get("field"))) else -0.05
+            return 0.18 if self._gold_abstains(task, str(action.get("field"))) else -0.08
         if name in {"write_claims_chunk", "write_claims_batch"}:
             if int(result.get("valid_crop_count") or 0) <= 0:
                 return -0.05
             reward = 0.0
             for claim in action.get("claims") or []:
-                if self.reward_mode == "field_policy_probe":
+                if is_placeholder_claim_value(claim.get("value")):
+                    reward += -0.18 if self.reward_mode == "field_policy_probe" else -0.12
+                elif self.reward_mode == "field_policy_probe":
                     reward += 0.28 if self._claim_supported(task, claim) else -0.12
                 else:
                     reward += 0.2 if self._claim_supported(task, claim) else -0.05
             for abstain in action.get("abstains") or []:
-                reward += 0.1 if self._gold_abstains(task, str(abstain.get("field"))) else -0.05
+                reward += 0.18 if self._gold_abstains(task, str(abstain.get("field"))) else -0.08
             return reward
         if name == "finish":
             history = list(result.get("history") or [])
@@ -221,6 +226,7 @@ class EvidenceVerifier:
         efficiency = max(0.0, 1.0 - max(0, steps - 8) / max(1, max_steps))
         invalid_penalty = min(1.0, invalid_steps / max(1, steps))
         unsupported_penalty = claim_metrics["unsupported_claim_count"] / max(1, claim_metrics["predicted_claim_count"])
+        placeholder_penalty = claim_metrics["placeholder_claim_count"] / max(1, claim_metrics["predicted_claim_count"])
         evidence_hit_bonus = 1.0 if evidence_hits else 0.0
         target_recall = 0.20
         evidence_recall_bonus = min(1.0, evidence_recall / target_recall)
@@ -239,6 +245,7 @@ class EvidenceVerifier:
             invalid_penalty=invalid_penalty,
             unsupported_penalty=unsupported_penalty,
             core_unsupported_penalty=core_unsupported_penalty,
+            placeholder_penalty=placeholder_penalty,
             premature_finish_penalty=premature_finish_penalty,
         )
 
@@ -255,11 +262,12 @@ class EvidenceVerifier:
                 + 0.18 * core_supported_bonus
                 + 0.04 * core_written_bonus
                 + 0.10 * finish_quality_bonus
-                + 0.05 * claim_metrics["abstain_accuracy"]
+                + 0.12 * claim_metrics["abstain_accuracy"]
                 + 0.05 * efficiency
                 - 0.10 * invalid_penalty
                 - 0.10 * unsupported_penalty
                 - 0.08 * core_unsupported_penalty
+                - 0.14 * placeholder_penalty
                 - 0.25 * premature_finish_penalty
             )
         final_reward = max(-1.0, min(1.0, final_reward))
@@ -334,6 +342,7 @@ class EvidenceVerifier:
         local_caption_only_claim_count = 0
         local_caption_only_risk_field_claim_count = 0
         local_caption_only_unsupported_count = 0
+        placeholder_claim_count = 0
 
         for field, pred in pred_by_field.items():
             gold = gold_by_field.get(field)
@@ -345,6 +354,8 @@ class EvidenceVerifier:
                 if gold is not None and gold.get("abstain"):
                     correct_abstains += 1
                 continue
+            if is_placeholder_claim_value(pred.get("value")):
+                placeholder_claim_count += 1
             evidence_ids = [str(eid) for eid in pred.get("evidence_ids") or []]
             local_caption_only = bool(evidence_ids) and all(eid.startswith("local_caption_") for eid in evidence_ids)
             local_caption_risk_field = local_caption_only and field in LOCAL_CAPTION_RISK_FIELDS
@@ -390,6 +401,7 @@ class EvidenceVerifier:
             "local_caption_only_claim_count": local_caption_only_claim_count,
             "local_caption_only_risk_field_claim_count": local_caption_only_risk_field_claim_count,
             "local_caption_only_unsupported_count": local_caption_only_unsupported_count,
+            "placeholder_claim_count": placeholder_claim_count,
             "claim_support_precision": claim_support_precision,
             "claim_support_recall": claim_support_recall,
             "claim_support_f1": f1_score(claim_support_precision, claim_support_recall),
@@ -501,6 +513,7 @@ def field_policy_score(
     invalid_penalty: float,
     unsupported_penalty: float,
     core_unsupported_penalty: float,
+    placeholder_penalty: float,
     premature_finish_penalty: float,
 ) -> float:
     """Selection score for field/evidence-policy probes.
@@ -516,10 +529,11 @@ def field_policy_score(
         + 0.16 * core_supported_bonus
         + 0.14 * min(1.0, opened_recall / 0.20)
         + 0.18 * min(1.0, cited_recall / 0.20)
-        + 0.06 * abstain_accuracy
+        + 0.12 * abstain_accuracy
         - 0.10 * invalid_penalty
         - 0.16 * unsupported_penalty
         - 0.12 * core_unsupported_penalty
+        - 0.20 * placeholder_penalty
         - 0.25 * premature_finish_penalty
     )
     return max(-1.0, min(1.0, float(score)))

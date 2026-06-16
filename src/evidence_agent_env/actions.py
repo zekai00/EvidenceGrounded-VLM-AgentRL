@@ -23,6 +23,10 @@ ALLOWED_ACTIONS = {
     "finish",
 }
 
+ACTION_ALIASES = {
+    "claim_one": "write_claim",
+}
+
 REQUIRED_KEYS: dict[str, set[str]] = {
     "inspect_page": set(),
     "propose_regions": set(),
@@ -40,6 +44,47 @@ REQUIRED_KEYS: dict[str, set[str]] = {
 }
 
 RETRIEVAL_SCOPES = {"current_page", "nearby_pages", "same_document", "corpus"}
+RETRIEVAL_SCOPE_ALIASES = {
+    "current": "current_page",
+    "currentpage": "current_page",
+    "this_page": "current_page",
+    "thispage": "current_page",
+    "same_page": "current_page",
+    "samepage": "current_page",
+    "page": "current_page",
+    "nearby": "nearby_pages",
+    "nearby_page": "nearby_pages",
+    "nearby_pages": "nearby_pages",
+    "neighbor_pages": "nearby_pages",
+    "same_doc": "same_document",
+    "samedoc": "same_document",
+    "same_document": "same_document",
+    "samedocument": "same_document",
+    "document": "same_document",
+    "doc": "same_document",
+    "top_left": "same_document",
+    "top_1": "same_document",
+    "top1": "same_document",
+    "top": "same_document",
+    "image_or_page_note": "same_document",
+    "page_note": "same_document",
+    "top_doc_or_local_page": "same_document",
+    "local_page": "same_document",
+    "local": "same_document",
+    "local_or_attached": "same_document",
+    "local_or_attached_evidence": "same_document",
+    "attached": "same_document",
+    "attached_evidence": "same_document",
+    "local_caption": "same_document",
+    "caption": "same_document",
+    "visual": "same_document",
+    "figure": "same_document",
+    "target": "same_document",
+    "all": "corpus",
+    "global": "corpus",
+    "database": "corpus",
+    "kb": "corpus",
+}
 
 
 def parse_action(action: str | dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -57,6 +102,11 @@ def parse_action(action: str | dict[str, Any]) -> tuple[dict[str, Any] | None, s
     if not isinstance(parsed, dict):
         return None, "action JSON must be an object"
     return normalize_action_shape(parsed), None
+
+
+def canonical_action_name(name: Any) -> str:
+    raw = str(name or "").strip()
+    return ACTION_ALIASES.get(raw, raw)
 
 
 def repair_truncated_retrieve_action(text: str) -> dict[str, Any] | None:
@@ -92,16 +142,29 @@ def repair_truncated_retrieve_action(text: str) -> dict[str, Any] | None:
 def normalize_action_shape(action: dict[str, Any]) -> dict[str, Any]:
     """Repair common schema slips without changing the intended tool call."""
 
-    if action.get("action") == "retrieve_evidence":
-        return normalize_retrieve_shape(action)
-    if action.get("action") == "write_claim":
-        return normalize_claim_shape(action)
-    if action.get("action") not in {"write_claims_chunk", "write_claims_batch"}:
-        return action
-    claims = [normalize_claim_shape(item) for item in (action.get("claims") or []) if isinstance(item, dict)]
+    repaired = dict(action)
+    original_name = repaired.get("action")
+    canonical_name = canonical_action_name(original_name)
+    if canonical_name != original_name:
+        repaired["action"] = canonical_name
+        repaired_keys = list(repaired.get("_schema_repaired_keys") or [])
+        reasons = list(repaired.get("_schema_repair_reasons") or [])
+        if "action" not in repaired_keys:
+            repaired_keys.append("action")
+        reasons.append(f"action alias normalized from {original_name!r} to {canonical_name!r}")
+        repaired["_schema_repaired_keys"] = repaired_keys
+        repaired["_schema_repair_reasons"] = reasons
+
+    if repaired.get("action") == "retrieve_evidence":
+        return normalize_retrieve_shape(repaired)
+    if repaired.get("action") == "write_claim":
+        return normalize_claim_shape(repaired)
+    if repaired.get("action") not in {"write_claims_chunk", "write_claims_batch"}:
+        return repaired
+    claims = [normalize_claim_shape(item) for item in (repaired.get("claims") or []) if isinstance(item, dict)]
     repaired_abstains: list[Any] = []
     changed = False
-    for item in action.get("abstains") or []:
+    for item in repaired.get("abstains") or []:
         if (
             isinstance(item, dict)
             and "reason" not in item
@@ -115,7 +178,6 @@ def normalize_action_shape(action: dict[str, Any]) -> dict[str, Any]:
     bounded_abstains = repaired_abstains[: max(0, 2 - len(bounded_claims))]
     if len(bounded_claims) != len(claims) or len(bounded_abstains) != len(repaired_abstains):
         changed = True
-    repaired = dict(action)
     repaired["claims"] = bounded_claims
     repaired["abstains"] = bounded_abstains
     return repaired if changed or repaired != action else action
@@ -130,10 +192,34 @@ def normalize_retrieve_shape(action: dict[str, Any]) -> dict[str, Any]:
         if "scope" not in repaired_keys:
             repaired_keys.append("scope")
         reasons.append("missing retrieve_evidence.scope")
+    else:
+        original_scope = str(repaired.get("scope"))
+        canonical_scope = canonical_retrieval_scope(original_scope, repaired)
+        if canonical_scope != original_scope:
+            repaired["scope"] = canonical_scope
+            if "scope" not in repaired_keys:
+                repaired_keys.append("scope")
+            reasons.append(f"invalid retrieve_evidence.scope normalized from {original_scope!r} to {canonical_scope!r}")
     if repaired_keys:
         repaired["_schema_repaired_keys"] = repaired_keys
         repaired["_schema_repair_reasons"] = reasons
     return repaired
+
+
+def canonical_retrieval_scope(scope: Any, action: dict[str, Any] | None = None) -> str:
+    raw = str(scope or "").strip()
+    if raw in RETRIEVAL_SCOPES:
+        return raw
+    normalized = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+    if normalized in RETRIEVAL_SCOPES:
+        return normalized
+    if normalized in RETRIEVAL_SCOPE_ALIASES:
+        return RETRIEVAL_SCOPE_ALIASES[normalized]
+    if re.fullmatch(r"top_?\d+", normalized):
+        return "same_document"
+    if "local" in normalized or "attached" in normalized or "page" in normalized or "image" in normalized:
+        return "same_document"
+    return infer_default_retrieval_scope(action or {})
 
 
 def infer_default_retrieval_scope(action: dict[str, Any]) -> str:
@@ -142,7 +228,7 @@ def infer_default_retrieval_scope(action: dict[str, Any]) -> str:
         return "nearby_pages"
     if action.get("source_file") or action.get("page") is not None or action.get("bbox"):
         return "same_document"
-    return "corpus"
+    return "same_document"
 
 
 def normalize_claim_shape(claim: dict[str, Any]) -> dict[str, Any]:

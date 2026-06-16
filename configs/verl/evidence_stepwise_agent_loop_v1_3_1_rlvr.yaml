@@ -13,10 +13,11 @@
     region_selection_hint: true
     strict_claim_phase_hint: true
     dynamic_tool_schema: false
+    field_policy_prompt: true
     compact_state_update: true
-    state_update_chars: 900
+    state_update_chars: 760
     max_action_tokens: 128
-    max_claim_action_tokens: 640
+    max_claim_action_tokens: 256
     tool_image_max_pixels: 65536
     target_claim_fields:
       - caption_text
@@ -30,4 +31,5 @@
       - medium_material
   include_tool_images: true
   max_state_regions: 8
+  max_steps_override: 16
   auto_finish: true
