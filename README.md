@@ -64,11 +64,17 @@ v1.3.1 数据构造 -> SFT -> RLVR / GRPO
 
 ## 数据对象
 
-### FigureTarget
+1. Inspect the page and candidate regions.
+2. Crop the correct target artwork region.
+3. Open local caption / visual / page-body evidence.
+4. Retrieve additional evidence only when needed.
+5. Write field-level claims with explicit `evidence_ids`.
+6. Use `abstain_claim` when no evidence supports a field.
+7. Call `finish` only after all required fields are written or abstained.
 
 单个 PDF 页面上的目标图像，包含页面图、目标框、caption 框、来源 PDF、split、目标字段和 gold 字段。
 
-### EvidenceFragment
+## 🧱 System Design / 系统设计
 
 可被打开、检索或引用的证据片段。常见类型包括：
 
@@ -78,16 +84,15 @@ v1.3.1 数据构造 -> SFT -> RLVR / GRPO
 - `retrieved_text`
 - `wrong_target_caption`
 
-### FieldSupportLabel
+- `FigureTarget`: target artwork on a page, including page image, target bbox, caption bbox, source PDF, split, and gold fields.
+- `EvidenceFragment`: local caption, visual crop, same-page body text, retrieved text, or wrong-target distractor evidence.
+- `FieldSupportLabel`: `(target, field, fragment)` support label used by SFT construction, reward assignment, and evaluation.
 
 `(target, field, fragment)` 级别的支持关系标签，用于 SFT 构造、reward 分配和评测。
 
 支持关系包括：
 
-- `support`
-- `no_support`
-- `ambiguous`
-- `wrong_target`
+### 2. SFT / 监督微调
 
 ## 当前数据集
 
